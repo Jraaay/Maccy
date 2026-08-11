@@ -1,0 +1,91 @@
+name: Package
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Package Maccy (${{ matrix.arch }})
+    runs-on: macos-26
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - arm64
+          - x86_64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Show build environment
+        run: xcodebuild -version
+
+      - name: Build release archive
+        run: |
+          xcodebuild archive \
+            -project Maccy.xcodeproj \
+            -scheme Maccy \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -archivePath "$RUNNER_TEMP/Maccy-${{ matrix.arch }}.xcarchive" \
+            -disableAutomaticPackageResolution \
+            ARCHS="${{ matrix.arch }}" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Create package
+        id: package
+        run: |
+          archive_app="$RUNNER_TEMP/Maccy-${{ matrix.arch }}.xcarchive/Products/Applications/Maccy.app"
+          package_dir="$RUNNER_TEMP/package-${{ matrix.arch }}"
+          package_app="$package_dir/Maccy.app"
+          package_name="Maccy-${{ matrix.arch }}.app.zip"
+
+          test -d "$archive_app"
+          mkdir -p "$package_dir"
+          ditto --arch "${{ matrix.arch }}" "$archive_app" "$package_app"
+
+          binary="$package_app/Contents/MacOS/Maccy"
+          test -x "$binary"
+          lipo -info "$binary"
+          test "$(lipo -archs "$binary")" = "${{ matrix.arch }}"
+
+          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$package_app/Contents/Info.plist")
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$package_app" "dist/$package_name"
+          cd dist
+          shasum -a 256 "$package_name" > "$package_name.sha256"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify package
+        run: |
+          cd dist
+          unzip -t "Maccy-${{ matrix.arch }}.app.zip"
+          shasum -a 256 -c "Maccy-${{ matrix.arch }}.app.zip.sha256"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: Maccy-${{ steps.package.outputs.version }}-${{ matrix.arch }}-${{ github.run_number }}
+          path: |
+            dist/Maccy-${{ matrix.arch }}.app.zip
+            dist/Maccy-${{ matrix.arch }}.app.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
