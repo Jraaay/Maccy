@@ -93,8 +93,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   // Describe the complete item independently of its potentially truncated visual content.
   var accessibilityLabel: String {
     var parts: [String] = []
-    if hasImage, let image = item.image {
-      let size = image.pixelSize
+    if hasImage, let size = item.imagePixelSize {
       parts.append(String(format: NSLocalizedString("history_item_image_accessibility_label_no_app", comment: ""), Int(size.width), Int(size.height)))
     } else {
       parts.append(title)
@@ -168,32 +167,28 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   @MainActor
   func cleanupImages() {
     thumbnailImageGenerationTask?.cancel()
-    previewImageGenerationTask?.cancel()
     thumbnailImageGenerationTask = nil
-    previewImageGenerationTask = nil
     thumbnailImage?.recache()
-    previewImage?.recache()
     thumbnailImage = nil
+    cleanupPreviewImage()
+  }
+
+  @MainActor
+  func cleanupPreviewImage() {
+    previewImageGenerationTask?.cancel()
+    previewImageGenerationTask = nil
+    previewImage?.recache()
     previewImage = nil
-    item.clearDecodedImageCache()
   }
 
   @MainActor
   private func generateThumbnailImage() {
-    guard let image = item.image else {
-      return
-    }
-    thumbnailImage = image.resized(to: HistoryItemDecorator.thumbnailImageSize)
-    item.clearDecodedImageCache()
+    thumbnailImage = item.scaledImage(to: HistoryItemDecorator.thumbnailImageSize)
   }
 
   @MainActor
   private func generatePreviewImage() {
-    guard let image = item.image else {
-      return
-    }
-    previewImage = image.resized(to: HistoryItemDecorator.previewImageSize)
-    item.clearDecodedImageCache()
+    previewImage = item.scaledImage(to: HistoryItemDecorator.previewImageSize)
   }
 
   @MainActor

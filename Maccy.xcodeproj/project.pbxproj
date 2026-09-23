@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A12233445566778899000001 /* ContentFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A12233445566778899000002 /* ContentFileStore.swift */; };
+		A12233445566778899000003 /* LegacyStorage.sqlite in Resources */ = {isa = PBXBuildFile; fileRef = A12233445566778899000004 /* LegacyStorage.sqlite */; };
 		0ABDD5122BB47F1E0054963B /* NSWorkspace+ApplicationName.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0ABDD5112BB47F1E0054963B /* NSWorkspace+ApplicationName.swift */; };
 		21FFF308D9217B43FD4C393F /* VoiceOver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B21DCA6C3D17E48D33D6E608 /* VoiceOver.swift */; };
 		2F0EC7792E7727E3003E2EA9 /* HeightReaderModifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F0EC7782E7727E3003E2EA9 /* HeightReaderModifier.swift */; };
@@ -187,6 +189,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A12233445566778899000002 /* ContentFileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentFileStore.swift; sourceTree = "<group>"; };
+		A12233445566778899000004 /* LegacyStorage.sqlite */ = {isa = PBXFileReference; lastKnownFileType = file; path = LegacyStorage.sqlite; sourceTree = "<group>"; };
 		088F4DA628BECBC40003AD19 /* tr */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = tr; path = tr.lproj/Localizable.strings; sourceTree = "<group>"; };
 		0ABDD5112BB47F1E0054963B /* NSWorkspace+ApplicationName.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NSWorkspace+ApplicationName.swift"; sourceTree = "<group>"; };
 		11680E44DAF848ADB8BA358E /* pt */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = pt; path = pt.lproj/PinsSettings.strings; sourceTree = "<group>"; };
@@ -787,6 +791,7 @@
 		DA48AE852A5F0077006D4894 /* Fixtures */ = {
 			isa = PBXGroup;
 			children = (
+				A12233445566778899000004 /* LegacyStorage.sqlite */,
 				DA48AE882A5F0548006D4894 /* guy.jpeg */,
 			);
 			path = Fixtures;
@@ -871,6 +876,7 @@
 				2F0EC7802E773F1D003E2EA9 /* PasteStack.swift */,
 				DA689FC72C1D15140009B887 /* PinsPosition.swift */,
 				DA689FC52C1D14F10009B887 /* PopupPosition.swift */,
+				A12233445566778899000002 /* ContentFileStore.swift */,
 				DAC14123232367B200FCFA30 /* Search.swift */,
 				2F1A79BF2C6DFB7800C98EBD /* SearchVisibility.swift */,
 				2F0EC77C2E773314003E2EA9 /* Selection.swift */,
@@ -1061,6 +1067,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A12233445566778899000003 /* LegacyStorage.sqlite in Resources */,
 				DA48AE892A5F0548006D4894 /* guy.jpeg in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1217,6 +1224,7 @@
 				FFFC00000000000000000001 /* String+UnsafeForTitleLayout.swift in Sources */,
 				F18F166970893C503065D056 /* View+ButtonAction.swift in Sources */,
 				9B24FC30A093450F29E2CC4A /* View+Invisible.swift in Sources */,
+				A12233445566778899000001 /* ContentFileStore.swift in Sources */,
 				DAC14124232367B200FCFA30 /* Search.swift in Sources */,
 				DA0FFA2A2C8D100C00A66C97 /* ModifierFlags+Description.swift in Sources */,
 				DAEE38471E3DBEB100DD2966 /* AppDelegate.swift in Sources */,

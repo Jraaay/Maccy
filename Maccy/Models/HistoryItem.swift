@@ -1,5 +1,6 @@
 import AppKit
 import Defaults
+import ImageIO
 import Sauce
 import SwiftData
 import Vision
@@ -74,7 +75,6 @@ class HistoryItem {
   @Relationship(deleteRule: .cascade, inverse: \HistoryItemContent.item)
   var contents: [HistoryItemContent] = []
 
-  @Transient private var cachedDecodedImage: NSImage?
 
   init(contents: [HistoryItemContent] = []) {
     self.firstCopiedAt = firstCopiedAt
@@ -88,12 +88,12 @@ class HistoryItem {
         !Self.transientTypes.contains(content.type)
       }
       .allSatisfy { content in
-        contents.contains(where: { $0.type == content.type && $0.value == content.value })
+        contents.contains(where: { $0.type == content.type && $0.hasSameData(as: content) })
       }
   }
 
   func generateTitle() -> String {
-    guard image == nil else {
+    guard !hasImage else {
       Task {
         self.performTextRecognition()
       }
@@ -172,15 +172,58 @@ class HistoryItem {
   }
 
   var image: NSImage? {
-    if let img = cachedDecodedImage {
-      return img
-    }
-    guard let data = imageData else {
-      return nil
-    }
+    guard let data = imageData else { return nil }
+    return NSImage(data: data)
+  }
 
-    cachedDecodedImage = NSImage(data: data)
-    return cachedDecodedImage
+  var imagePixelSize: NSSize? {
+    guard let source = imageSource(),
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+          let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else { return nil }
+    return NSSize(width: width.doubleValue, height: height.doubleValue)
+  }
+
+  func scaledImage(to bounds: NSSize, scale: CGFloat = 2) -> NSImage? {
+    guard let source = imageSource(),
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+          let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else { return nil }
+    let pixelSize = NSSize(width: width.doubleValue, height: height.doubleValue)
+    let dpiX = (properties[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue ?? 72
+    let dpiY = (properties[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue ?? 72
+    var size = NSSize(width: pixelSize.width * 72 / max(1, dpiX), height: pixelSize.height * 72 / max(1, dpiY))
+    if let orientation = properties[kCGImagePropertyOrientation] as? NSNumber,
+       (5...8).contains(orientation.intValue) {
+      size = NSSize(width: size.height, height: size.width)
+    }
+    guard size.width > 0, size.height > 0, bounds.width > 0, bounds.height > 0 else { return nil }
+    let ratio = min(1, bounds.width / size.width, bounds.height / size.height)
+    let displaySize = NSSize(width: size.width * ratio, height: size.height * ratio)
+    let maxPixels = max(1, min(max(pixelSize.width, pixelSize.height), max(displaySize.width, displaySize.height) * scale))
+    let options: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceThumbnailMaxPixelSize: Int(ceil(maxPixels)),
+      kCGImageSourceShouldCacheImmediately: true
+    ]
+    guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+    return NSImage(cgImage: thumbnail, size: displaySize)
+  }
+
+  private func imageSource() -> CGImageSource? {
+    let options = [kCGImageSourceShouldCache: false] as CFDictionary
+    if let content = contents.first(where: { Self.imageTypes.contains(NSPasteboard.PasteboardType($0.type)) }) {
+      if let url = content.fileURL {
+        return CGImageSourceCreateWithURL(url as CFURL, options)
+      }
+      if let data = content.data {
+        return CGImageSourceCreateWithData(data as CFData, options)
+      }
+    } else if universalClipboardImage, let url = fileURLs.first {
+      return CGImageSourceCreateWithURL(url as CFURL, options)
+    }
+    return nil
   }
 
   var rtfData: Data? { contentData([.rtf]) }
@@ -190,12 +233,6 @@ class HistoryItem {
     }
 
     return NSAttributedString(rtf: data, documentAttributes: nil)
-  }
-
-  func clearDecodedImageCache() {
-    guard cachedDecodedImage != nil else { return }
-    cachedDecodedImage?.recache()
-    cachedDecodedImage = nil
   }
 
   var text: String? {
@@ -215,12 +252,16 @@ class HistoryItem {
     return Int(modified)
   }
 
-  var fromMaccy: Bool { contentData([.fromMaccy]) != nil }
-  var universalClipboard: Bool { contentData([.universalClipboard]) != nil }
+  var fromMaccy: Bool { hasContent([.fromMaccy]) }
+  var universalClipboard: Bool { hasContent([.universalClipboard]) }
 
   private var universalClipboardImage: Bool { universalClipboard && fileURLs.first?.pathExtension == "jpeg" }
   private var universalClipboardText: Bool {
-    universalClipboard && contentData([.html, .tiff, .png, .jpeg, .rtf, .string, .heic]) != nil
+    universalClipboard && hasContent([.html, .tiff, .png, .jpeg, .rtf, .string, .heic])
+  }
+
+  private func hasContent(_ types: [NSPasteboard.PasteboardType]) -> Bool {
+    contents.contains { types.contains(NSPasteboard.PasteboardType($0.type)) && $0.hasValue }
   }
 
   private func contentData(_ types: [NSPasteboard.PasteboardType]) -> Data? {
@@ -228,13 +269,13 @@ class HistoryItem {
       return types.contains(NSPasteboard.PasteboardType(content.type))
     })
 
-    return content?.value
+    return content?.data
   }
 
   private func allContentData(_ types: [NSPasteboard.PasteboardType]) -> [Data] {
     return contents
       .filter { types.contains(NSPasteboard.PasteboardType($0.type)) }
-      .compactMap { $0.value }
+      .compactMap { $0.data }
   }
 
   private func performTextRecognition() {
@@ -242,7 +283,6 @@ class HistoryItem {
       return
     }
 
-    defer { clearDecodedImageCache() }
     let requestHandler = VNImageRequestHandler(cgImage: cgImage)
     let request = VNRecognizeTextRequest(completionHandler: recognizeTextHandler)
     request.recognitionLevel = .fast

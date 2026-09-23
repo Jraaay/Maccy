@@ -78,6 +78,24 @@ class HistoryTests: XCTestCase { // swiftlint:disable:this type_body_length
     XCTAssertEqual(history.items.map(\.item), expected.map(\.item))
   }
 
+  func testImageFilesAreRemovedOnlyAfterTheirReferencesAreDeleted() throws {
+    let bytes = Data(repeating: 42, count: 256)
+    let original = HistoryItemContent(type: "public.png", value: bytes)
+    let first = history.add(HistoryItem(contents: [original]))
+    let originalURL = try XCTUnwrap(original.fileURL)
+    let duplicateContent = HistoryItemContent(type: "public.png", value: bytes)
+    let duplicateURL = try XCTUnwrap(duplicateContent.fileURL)
+    let merged = history.add(HistoryItem(contents: [duplicateContent]))
+    XCTAssertNotEqual(first, merged)
+    XCTAssertEqual(history.all.count, 1)
+    try Storage.shared.saveAndCleanPayloads()
+    XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: duplicateURL.path))
+    XCTAssertEqual(try merged.item.contents.first?.readData(), bytes)
+    history.delete(merged)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
+  }
+
   func testDefaultIsEmpty() {
     XCTAssertEqual(history.items, [])
   }

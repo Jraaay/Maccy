@@ -177,6 +177,19 @@ class HistoryItemDecoratorTests: XCTestCase {
     XCTAssertNotNil(decorator.thumbnailImage)
   }
 
+  func testClosingPreviewReleasesItButKeepsTheThumbnail() async {
+    let decorator = historyItemDecorator(NSImage(named: "NSApplicationIcon")!)
+    decorator.sizeImages()
+    let thumbnail = decorator.thumbnailImage
+    XCTAssertNotNil(decorator.previewImage)
+    decorator.cleanupPreviewImage()
+    XCTAssertNil(decorator.previewImage)
+    XCTAssertTrue(decorator.thumbnailImage === thumbnail)
+    decorator.ensurePreviewImage()
+    _ = await decorator.previewImageGenerationTask?.result
+    XCTAssertNotNil(decorator.previewImage)
+  }
+
   func testResizedImageDoesNotRetainSource() {
     weak var source: NSImage?
     var resized: NSImage?

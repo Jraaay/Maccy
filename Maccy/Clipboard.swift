@@ -1,6 +1,7 @@
 import AppKit
 import Defaults
 import Sauce
+import Logging
 
 class Clipboard {
   static let shared = Clipboard()
@@ -10,7 +11,7 @@ class Clipboard {
   private var onNewCopyHooks: [OnNewCopyHook] = []
   var changeCount: Int
 
-  private let pasteboard = NSPasteboard.general
+  private let pasteboard: NSPasteboard
 
   private var timer: Timer?
 
@@ -35,7 +36,8 @@ class Clipboard {
 
   private var sourceApp: NSRunningApplication? { NSWorkspace.shared.frontmostApplication }
 
-  init() {
+  init(pasteboard: NSPasteboard = .general) {
+    self.pasteboard = pasteboard
     changeCount = pasteboard.changeCount
   }
 
@@ -71,28 +73,36 @@ class Clipboard {
     checkForChangesInPasteboard()
   }
 
+  @discardableResult
   @MainActor
-  func copy(_ item: HistoryItem?, removeFormatting: Bool = false) {
-    guard let item else { return }
-
-    pasteboard.clearContents()
+  func copy(_ item: HistoryItem?, removeFormatting: Bool = false) -> Bool {
+    guard let item else { return false }
     var contents = item.contents
 
     if removeFormatting {
       contents = clearFormatting(contents)
     }
 
-    for content in contents {
+    let payloads: [(type: String, data: Data?)]
+    do {
+      payloads = try contents.map { ($0.type, try $0.readData()) }
+    } catch {
+      Logger(label: "org.p0deje.Maccy").error("Cannot copy clipboard payload from disk: \(error)")
+      return false
+    }
+    // Leave the existing clipboard intact if any required file cannot be read.
+    pasteboard.clearContents()
+    for content in payloads {
       guard content.type != NSPasteboard.PasteboardType.fileURL.rawValue else { continue }
-      pasteboard.setData(content.value, forType: NSPasteboard.PasteboardType(content.type))
+      pasteboard.setData(content.data, forType: NSPasteboard.PasteboardType(content.type))
     }
 
     // Use writeObjects for file URLs so that multiple files that are copied actually work.
     // Only do this for file URLs because it causes an issue with some other data types (like formatted text)
     // where the item is pasted more than once.
-    let fileURLItems: [NSPasteboardItem] = contents.compactMap { item in
+    let fileURLItems: [NSPasteboardItem] = payloads.compactMap { item in
       guard item.type == NSPasteboard.PasteboardType.fileURL.rawValue else { return nil }
-      guard let value = item.value else { return nil }
+      guard let value = item.data else { return nil }
       let pasteItem = NSPasteboardItem()
       pasteItem.setData(value, forType: NSPasteboard.PasteboardType(item.type))
       return pasteItem
@@ -107,6 +117,7 @@ class Clipboard {
       Notifier.notify(body: item.title, sound: .knock)
       checkForChangesInPasteboard()
     }
+    return true
   }
 
   // Based on https://github.com/Clipy/Clipy/blob/develop/Clipy/Sources/Services/PasteService.swift.

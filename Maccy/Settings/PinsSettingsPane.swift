@@ -45,7 +45,7 @@ struct PinValueView: View {
 
     // Check if this item has editable text content
     let hasPlainText = item.text != nil
-    let hasImage = item.image != nil
+    let hasImage = item.hasImage
     let hasFileURLs = !item.fileURLs.isEmpty
     let hasRichText = item.rtf != nil || item.html != nil
 
@@ -101,7 +101,8 @@ struct PinValueView: View {
     // Update or add the plain text content
     if let index = item.contents.firstIndex(where: { $0.type == stringType }) {
       if let data = editableValue.data(using: .utf8) {
-        item.contents[index].value = data
+        item.contents[index].data = data
+        Storage.shared.schedulePayloadCleanup()
       }
     } else {
       if let data = editableValue.data(using: .utf8) {

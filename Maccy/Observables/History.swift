@@ -204,6 +204,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       AppState.shared.popup.needsResize = true
     }
 
+    Storage.shared.schedulePayloadCleanup()
     return itemDecorator
   }
 
@@ -243,7 +244,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
         )
       }
       Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
+      try? Storage.shared.saveAndCleanPayloads(discardMigrationBackup: true)
     }
 
     Clipboard.shared.clear()
@@ -278,7 +279,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
         logger.error("Failed to clear storage: \(String(reflecting: error))")
       }
       Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
+      try? Storage.shared.saveAndCleanPayloads(discardMigrationBackup: true)
     }
 
     Clipboard.shared.clear()
@@ -296,7 +297,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     withLogging("Removing history item") {
       deleteFromStorage(item.item)
       Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
+      try? Storage.shared.saveAndCleanPayloads(discardMigrationBackup: true)
     }
 
     all.removeAll { $0 == item }
@@ -335,7 +336,6 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
           item.thumbnailImageGenerationTask != nil || item.previewImageGenerationTask != nil {
         item.cleanupImages()
       }
-      item.item.clearDecodedImageCache()
     }
   }
 
@@ -352,7 +352,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     if modifierFlags.isEmpty {
       AppState.shared.popup.close()
-      Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault])
+      guard Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault]) else { return }
       if Defaults[.pasteByDefault] {
         Clipboard.shared.paste()
       }
@@ -360,14 +360,14 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       switch HistoryItemAction(modifierFlags) {
       case .copy:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item)
+        guard Clipboard.shared.copy(item.item) else { return }
       case .paste:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item)
+        guard Clipboard.shared.copy(item.item) else { return }
         Clipboard.shared.paste()
       case .pasteWithoutFormatting:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item, removeFormatting: true)
+        guard Clipboard.shared.copy(item.item, removeFormatting: true) else { return }
         Clipboard.shared.paste()
       case .unknown:
         return
@@ -393,18 +393,18 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     if modifierFlags.isEmpty {
       AppState.shared.popup.close()
-      Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault])
+      guard Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault]) else { return }
     } else {
       switch HistoryItemAction(modifierFlags) {
       case .copy:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item)
+        guard Clipboard.shared.copy(item.item) else { return }
       case .paste:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item)
+        guard Clipboard.shared.copy(item.item) else { return }
       case .pasteWithoutFormatting:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item, removeFormatting: true)
+        guard Clipboard.shared.copy(item.item, removeFormatting: true) else { return }
         Clipboard.shared.paste()
       case .unknown:
         return
@@ -441,15 +441,15 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     Task {
       if stack.modifierFlags.isEmpty {
-        await Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault])
+        guard await Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault]) else { pasteStack = nil; return }
       } else {
         switch HistoryItemAction(stack.modifierFlags) {
         case .copy:
-          await Clipboard.shared.copy(item.item)
+          guard await Clipboard.shared.copy(item.item) else { pasteStack = nil; return }
         case .paste:
-          await Clipboard.shared.copy(item.item)
+          guard await Clipboard.shared.copy(item.item) else { pasteStack = nil; return }
         case .pasteWithoutFormatting:
-          await Clipboard.shared.copy(item.item, removeFormatting: true)
+          guard await Clipboard.shared.copy(item.item, removeFormatting: true) else { pasteStack = nil; return }
         case .unknown:
           return
         }
