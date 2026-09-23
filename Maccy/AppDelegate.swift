@@ -1,6 +1,5 @@
 import Defaults
-// Keyboard events run on the main thread; retain Swift 5 compatibility with the Swift 6 dependency.
-@preconcurrency import KeyboardShortcuts
+import KeyboardShortcuts
 import Sparkle
 import SwiftUI
 
@@ -217,7 +216,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
   private func disableUnusedGlobalHotkeys() {
     let names: [KeyboardShortcuts.Name] = [.delete, .pin, .togglePreview]
-    KeyboardShortcuts.disable(names)
+    MainActor.assumeIsolated { KeyboardShortcuts.disable(names) }
 
     NotificationCenter.default.addObserver(
       forName: Notification.Name("KeyboardShortcuts_shortcutByNameDidChange"),
@@ -225,7 +224,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       queue: nil
     ) { notification in
       if let name = notification.userInfo?["name"] as? KeyboardShortcuts.Name, names.contains(name) {
-        KeyboardShortcuts.disable(name)
+        MainActor.assumeIsolated { KeyboardShortcuts.disable(name) }
       }
     }
   }

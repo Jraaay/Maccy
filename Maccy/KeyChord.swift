@@ -1,6 +1,5 @@
 import AppKit.NSEvent
-// Keyboard events run on the main thread; retain Swift 5 compatibility with the Swift 6 dependency.
-@preconcurrency import KeyboardShortcuts
+import KeyboardShortcuts
 import Sauce
 
 enum KeyChord: CaseIterable {
@@ -13,13 +12,13 @@ enum KeyChord: CaseIterable {
   }
 
   static var deleteKey: Key? { Sauce.shared.key(shortcut: .delete) }
-  static var deleteModifiers: NSEvent.ModifierFlags? { KeyboardShortcuts.Shortcut(name: .delete)?.modifiers }
+  static var deleteModifiers: NSEvent.ModifierFlags? { MainActor.assumeIsolated { KeyboardShortcuts.Shortcut(name: .delete)?.modifiers } }
 
   static var pinKey: Key? { Sauce.shared.key(shortcut: .pin) }
-  static var pinModifiers: NSEvent.ModifierFlags? { KeyboardShortcuts.Shortcut(name: .pin)?.modifiers }
+  static var pinModifiers: NSEvent.ModifierFlags? { MainActor.assumeIsolated { KeyboardShortcuts.Shortcut(name: .pin)?.modifiers } }
 
   static var previewKey: Key? { Sauce.shared.key(shortcut: .togglePreview) }
-  static var previewModifiers: NSEvent.ModifierFlags? { KeyboardShortcuts.Shortcut(name: .togglePreview)?.modifiers }
+  static var previewModifiers: NSEvent.ModifierFlags? { MainActor.assumeIsolated { KeyboardShortcuts.Shortcut(name: .togglePreview)?.modifiers } }
 
   case clearHistory
   case clearHistoryAll
