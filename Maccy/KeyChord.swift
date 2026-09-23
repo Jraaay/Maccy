@@ -1,5 +1,6 @@
 import AppKit.NSEvent
-import KeyboardShortcuts
+// Keyboard events run on the main thread; retain Swift 5 compatibility with the Swift 6 dependency.
+@preconcurrency import KeyboardShortcuts
 import Sauce
 
 enum KeyChord: CaseIterable {
