@@ -17,11 +17,22 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
 
   var title: String = "" {
     didSet {
-      guard title != oldValue else { return }
+      // Canonically equivalent strings can have different encoded offsets.
+      guard !title.utf8.elementsEqual(oldValue.utf8) else { return }
+      cachedSearchDocument = nil
       cachedAttributedTitle = nil
       highlightRanges = []
     }
   }
+  @ObservationIgnored private var cachedSearchDocument: Search.Document?
+
+  var searchDocument: Search.Document {
+    if let cachedSearchDocument { return cachedSearchDocument }
+    let document = Search.Document(id: id, title: title)
+    cachedSearchDocument = document
+    return document
+  }
+
   private var highlightRanges: [Range<String.Index>] = []
   private var isHighlighted = false
   @ObservationIgnored private var cachedAttributedTitle: AttributedString?

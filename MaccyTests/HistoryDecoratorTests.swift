@@ -155,6 +155,18 @@ class HistoryItemDecoratorTests: XCTestCase {
     XCTAssertEqual(String(decorator.attributedTitle!.characters), "new")
   }
 
+  func testSearchSnapshotChangesOnlyWhenTitleBytesChange() {
+    let decorator = historyItemDecorator("é")
+    let initial = decorator.searchDocument
+    XCTAssertEqual(decorator.searchDocument.revision, initial.revision)
+    decorator.title = "é"
+    XCTAssertEqual(decorator.searchDocument.revision, initial.revision)
+    decorator.title = "e\u{301}"
+    XCTAssertNotEqual(decorator.searchDocument.revision, initial.revision)
+    XCTAssertEqual(Array(decorator.searchDocument.title.utf8), Array("e\u{301}".utf8))
+    XCTAssertEqual(initial.title.utf8.count, 2, "The old snapshot must remain immutable")
+  }
+
   func testHashIsStableAcrossHighlightChanges() {
     let decorator = historyItemDecorator("foo bar")
     let set: Set = [decorator]

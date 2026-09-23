@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Defaults
 import Fuse
 
@@ -38,19 +39,131 @@ class Search {
   struct Document: Sendable {
     let id: UUID
     let title: String
+    // Immutable snapshots carry an identity so warm searches need not rescan
+    // every title just to decide whether its index is still valid.
+    let revision = UUID()
   }
 
-  struct Match: Sendable {
+  struct Match: Sendable, Equatable {
     let id: UUID
     var score: Double?
     var ranges: [Range<String.Index>] = []
+  }
+
+  // Confined to one actor: obsolete searches can be cancelled without racing
+  // updates to the cache. Only title text is indexed, never clipboard payloads.
+  actor Index {
+    private var entries: [UUID: IndexedTitle] = [:]
+
+    var documentCount: Int { entries.count }
+    var indexedByteCount: Int {
+      entries.values.reduce(0) { $0 + $1.bytes.count + $1.checkpoints.count * MemoryLayout<Checkpoint>.stride }
+    }
+
+    func prepare(documents: [Document]) {
+      retainCurrentDocuments(documents)
+      for document in documents {
+        guard !Task.isCancelled else { return }
+        _ = indexedTitle(for: document)
+      }
+    }
+
+    func search(string: String, documents: [Document], mode: Mode) -> [Match] {
+      guard !Task.isCancelled else { return [] }
+      retainCurrentDocuments(documents)
+      // Keep the original matcher for complex queries. In particular, expanding
+      // case folds (e.g. ß) and partial graphemes have different search semantics.
+      guard (mode == .exact || mode == .mixed), !string.isEmpty,
+            string.unicodeScalars.allSatisfy({
+              $0.isASCII || (0x3400...0x4DBF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value)
+            }) else {
+        return Search.search(string: string, documents: documents, mode: mode, isCancelled: { Task.isCancelled })
+      }
+      let needle = Self.fold(string)
+      return Search.search(
+        string: string, documents: documents, mode: mode, isCancelled: { Task.isCancelled },
+        candidateRange: { document in
+          let entry = self.indexedTitle(for: document)
+          guard let offset = entry.candidateUTF16Offset(for: needle) else { return nil }
+          let start = String.Index(utf16Offset: offset, in: document.title)
+          return start..<document.title.endIndex
+        }
+      )
+    }
+
+    func retain(documentIDs: Set<UUID>) {
+      entries = entries.filter { documentIDs.contains($0.key) }
+    }
+
+    private func retainCurrentDocuments(_ documents: [Document]) {
+      retain(documentIDs: Set(documents.map(\.id)))
+    }
+
+    private func indexedTitle(for document: Document) -> IndexedTitle {
+      if let entry = entries[document.id], entry.revision == document.revision { return entry }
+      let entry = autoreleasepool { IndexedTitle(document: document) }
+      entries[document.id] = entry
+      return entry
+    }
+
+    private static func fold(_ string: String) -> [UInt8] {
+      Array(string.folding(options: .caseInsensitive, locale: nil).decomposedStringWithCanonicalMapping.utf8)
+    }
+
+    private struct Checkpoint {
+      let byteOffset: Int
+      let utf16Offset: Int
+    }
+
+    private struct IndexedTitle {
+      let revision: UUID
+      var bytes: [UInt8] = []
+      var checkpoints: [Checkpoint] = []
+
+      init(document: Document) {
+        revision = document.revision
+        let title = document.title
+        var start = title.startIndex
+        var utf16Offset = 0
+        // Start verification at a known original grapheme boundary before the
+        // candidate. This preserves the original first match and its exact range.
+        while start < title.endIndex {
+          let end = title.index(start, offsetBy: 32, limitedBy: title.endIndex) ?? title.endIndex
+          let chunk = String(title[start..<end])
+          checkpoints.append(Checkpoint(byteOffset: bytes.count, utf16Offset: utf16Offset))
+          bytes.append(contentsOf: Index.fold(chunk))
+          utf16Offset += chunk.utf16.count
+          start = end
+        }
+      }
+
+      func candidateUTF16Offset(for needle: [UInt8]) -> Int? {
+        guard !needle.isEmpty, bytes.count >= needle.count else { return nil }
+        let offset: Int? = bytes.withUnsafeBytes { haystack in
+          needle.withUnsafeBytes { pattern in
+            guard let found = memmem(haystack.baseAddress!, haystack.count, pattern.baseAddress!, pattern.count) else {
+              return nil
+            }
+            return haystack.baseAddress!.distance(to: UnsafeRawPointer(found))
+          }
+        }
+        guard let offset else { return nil }
+        var lower = 0
+        var upper = checkpoints.count
+        while lower < upper {
+          let middle = (lower + upper) / 2
+          if checkpoints[middle].byteOffset <= offset { lower = middle + 1 } else { upper = middle }
+        }
+        return checkpoints[lower - 1].utf16Offset
+      }
+    }
   }
 
   func search(string: String, within: [Searchable]) -> [SearchResult] {
     let objects = Dictionary(uniqueKeysWithValues: within.map { ($0.id, $0) })
     return Self.search(
       string: string,
-      documents: within.map { Document(id: $0.id, title: $0.title) },
+      documents: within.map(\.searchDocument),
       mode: Defaults[.searchMode]
     ).compactMap { match in
       guard let object = objects[match.id] else { return nil }
@@ -62,20 +175,21 @@ class Search {
     string: String,
     documents: [Document],
     mode: Mode,
-    isCancelled: () -> Bool = { false }
+    isCancelled: () -> Bool = { false },
+    candidateRange: ((Document) -> Range<String.Index>?)? = nil
   ) -> [Match] {
     guard !isCancelled() else { return [] }
     guard !string.isEmpty else { return documents.map { Match(id: $0.id) } }
 
     switch mode {
     case .exact:
-      return exactSearch(string, documents, isCancelled)
+      return exactSearch(string, documents, isCancelled, candidateRange)
     case .regexp:
       return regexSearch(string, documents, isCancelled)
     case .fuzzy:
       return fuzzySearch(string, documents, isCancelled)
     case .mixed:
-      let exact = exactSearch(string, documents, isCancelled)
+      let exact = exactSearch(string, documents, isCancelled, candidateRange)
       guard exact.isEmpty, !isCancelled() else { return exact }
       let regex = regexSearch(string, documents, isCancelled)
       guard regex.isEmpty, !isCancelled() else { return regex }
@@ -84,12 +198,20 @@ class Search {
   }
 
   private static func exactSearch(
-    _ query: String, _ documents: [Document], _ isCancelled: () -> Bool
+    _ query: String, _ documents: [Document], _ isCancelled: () -> Bool,
+    _ candidateRange: ((Document) -> Range<String.Index>?)?
   ) -> [Match] {
     var results: [Match] = []
     for document in documents {
       guard !isCancelled() else { return [] }
-      if let range = document.title.range(of: query, options: .caseInsensitive) {
+      let bounds: Range<String.Index>
+      if let candidateRange {
+        guard let candidate = candidateRange(document) else { continue }
+        bounds = candidate
+      } else {
+        bounds = document.title.startIndex..<document.title.endIndex
+      }
+      if let range = document.title.range(of: query, options: .caseInsensitive, range: bounds) {
         results.append(Match(id: document.id, ranges: [range]))
       }
     }

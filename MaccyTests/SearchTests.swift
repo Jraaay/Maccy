@@ -294,6 +294,95 @@ class SearchTests: XCTestCase {
     }
   }
 
+  func testIndexedSearchPreservesUnicodeMatchesAndRanges() async {
+    let units = [
+      "a", "A", "é", "e\u{301}", "ß", "SS", "ﬃ", "ffi", "Æ", "ae", "K", "k",
+      "İ", "i", "ı", "I", "Σ", "σ", "ς", "ǅ", "ǆ", "ｶﾞ", "ガ", "か", "Ａ",
+      "각", "각", "ᄀ", "ᅡ", "\u{301}", "\u{323}", "\u{FE0F}", "\u{200D}",
+      "👩🏽‍💻", "👩", "🏽", "👨‍👩‍👧‍👦", "💻", "\0", "क़", "क़", "क", "ا", "أ",
+      "\u{34F}", "\u{200B}", "\u{AD}", "\r\n", "\r", "\n", "目标", "开发"
+    ]
+    let titles = units + units.map { "prefix \($0) suffix" } + units.map { $0 + "\u{301}\u{323}a" }
+    let documents = titles.map { Search.Document(id: UUID(), title: $0) }
+    let queries = units + ["s", "f", "fi", "ss", "e", "prefix", "suffix", "不存在", "", "^prefix"]
+    let index = Search.Index()
+    for query in queries {
+      for mode in [Search.Mode.exact, .mixed] {
+        let expected = Search.search(string: query, documents: documents, mode: mode)
+        let actual = await index.search(string: query, documents: documents, mode: mode)
+        XCTAssertEqual(actual, expected, "query=\(query.debugDescription) mode=\(mode)")
+      }
+    }
+  }
+
+  func testIndexedSearchAcrossCheckpointsAndFalseCandidates() async {
+    let index = Search.Index()
+    let leads = ["x", "é", "e\u{301}", "👩🏽‍💻", "ß", "각", "ｶﾞ", "开发"]
+    for lead in leads {
+      for padding in [0, 1, 30, 31, 32, 33, 62, 63, 64, 65, 127] {
+        let text = String(repeating: lead, count: padding)
+        let documents = [
+          text + "目标tokenA end", text + "CAFE end", text + "ss ffi i k a",
+          "café " + text + " cafe", text + "a\u{301}\u{323} END", text + "无结果"
+        ].map { Search.Document(id: UUID(), title: $0) }
+        for query in ["目标tokena", "TOKENA", "cafe", "ss", "ffi", "i", "k", "a", "END", "___absent___"] {
+          let expected = Search.search(string: query, documents: documents, mode: .exact)
+          let actual = await index.search(string: query, documents: documents, mode: .exact)
+          XCTAssertEqual(actual, expected, "lead=\(lead.debugDescription) padding=\(padding) query=\(query)")
+        }
+      }
+    }
+  }
+
+  func testIndexMatchesReferenceOnDeterministicMixedUnicodeText() async {
+    let units = ["t", "a", "r", "g", "e", "T", " ", "é", "e\u{301}", "ß", "İ", "👩🏽‍💻",
+                 "\u{AD}", "\u{34F}", "\u{200D}", "\u{FEFF}", "\u{2060}", "\r\n", "\0", "目标", "开发", "麗"]
+    var seed: UInt64 = 42
+    func next(_ bound: Int) -> Int {
+      seed = seed &* 6_364_136_223_846_793_005 &+ 1
+      return Int((seed >> 32) % UInt64(bound))
+    }
+    let documents = (0..<256).map { _ -> Search.Document in
+      var title = ""
+      for _ in 0..<100 { title += units[next(units.count)] }
+      return Search.Document(id: UUID(), title: title)
+    }
+    let index = Search.Index()
+    for query in ["target", "tArGeT", "a", "e", "i", "s", "ss", "ffi", "目标", "开发", "麗", "\n", "\0", "A B"] {
+      let actual = await index.search(string: query, documents: documents, mode: .exact)
+      XCTAssertEqual(actual, Search.search(string: query, documents: documents, mode: .exact), query)
+    }
+  }
+
+  func testIndexInvalidatesByteChangesAndRemovesDeletedDocuments() async {
+    let index = Search.Index()
+    let id = UUID()
+    let composed = Search.Document(id: id, title: String(repeating: "é", count: 64) + " target")
+    let decomposed = Search.Document(id: id, title: String(repeating: "e\u{301}", count: 64) + " target")
+    XCTAssertEqual(composed.title, decomposed.title)
+    await index.prepare(documents: [composed])
+    for document in [composed, decomposed, Search.Document(id: id, title: "different") ] {
+      let result = await index.search(string: "target", documents: [document], mode: .exact)
+      XCTAssertEqual(result, Search.search(string: "target", documents: [document], mode: .exact))
+    }
+    await index.retain(documentIDs: [])
+    let count = await index.documentCount
+    let bytes = await index.indexedByteCount
+    XCTAssertEqual(count, 0)
+    XCTAssertEqual(bytes, 0)
+  }
+
+  func testCancelledIndexedSearchReturnsNoResults() async {
+    let index = Search.Index()
+    let documents = (0..<100).map { Search.Document(id: UUID(), title: "entry \($0)") }
+    let task = Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      return await index.search(string: "entry", documents: documents, mode: .exact)
+    }
+    let result = await task.value
+    XCTAssertTrue(result.isEmpty)
+  }
+
   private func search(_ string: String) -> [Search.SearchResult] {
     return Search().search(string: string, within: items)
   }

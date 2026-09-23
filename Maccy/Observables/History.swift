@@ -44,6 +44,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   }
 
   private let sorter = Sorter()
+  @ObservationIgnored private let searchIndex = Search.Index()
+  @ObservationIgnored private var indexWarmupTask: Task<Void, Never>?
   @ObservationIgnored private var searchTask: Task<Void, Never>?
   @ObservationIgnored private var searchWorker: Task<[Search.Match], Never>?
   @ObservationIgnored private var searchGeneration = 0
@@ -59,6 +61,10 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   var all: [HistoryItemDecorator] = [] {
     didSet {
       // Invalidate in-flight results when entries are inserted, removed or reordered.
+      indexWarmupTask?.cancel()
+      let ids = Set(all.map(\.id))
+      let index = searchIndex
+      Task { await index.retain(documentIDs: ids) }
       searchGeneration += 1
       searchTask?.cancel()
       searchWorker?.cancel()
@@ -118,6 +124,10 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     limitHistorySize(to: Defaults[.size])
 
     updateShortcuts()
+    let documents = all.map(\.searchDocument)
+    let index = searchIndex
+    indexWarmupTask?.cancel()
+    indexWarmupTask = Task.detached(priority: .utility) { await index.prepare(documents: documents) }
     // Ensure that panel size is proper *after* loading all items.
     Task {
       AppState.shared.popup.needsResize = true
@@ -505,6 +515,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   }
 
   private func scheduleSearch() {
+    indexWarmupTask?.cancel()
     searchTask?.cancel()
     searchWorker?.cancel()
     searchGeneration += 1
@@ -512,27 +523,28 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     searchTask = Task { @MainActor [weak self] in
       guard let self else { return }
       let query = searchQuery
+      let mode = Defaults[.searchMode]
       // Coalesce rapid keystrokes, but clear the search immediately.
       if !query.isEmpty {
-        do { try await Task.sleep(for: .milliseconds(40)) } catch { return }
+        do { try await Task.sleep(for: .milliseconds(mode == .exact ? 15 : 40)) } catch { return }
       }
       guard !Task.isCancelled, generation == searchGeneration else { return }
-      let mode = Defaults[.searchMode]
       let snapshot = all
-      let documents = snapshot.map { Search.Document(id: $0.id, title: $0.title) }
+      let documents = snapshot.map(\.searchDocument)
       let matches: [Search.Match]
       if query.isEmpty {
         matches = documents.map { Search.Match(id: $0.id) }
       } else {
+        let index = searchIndex
         let worker = Task.detached(priority: .userInitiated) {
-          Search.search(string: query, documents: documents, mode: mode, isCancelled: { Task.isCancelled })
+          await index.search(string: query, documents: documents, mode: mode)
         }
         searchWorker = worker
         matches = await worker.value
       }
       guard !Task.isCancelled, generation == searchGeneration, query == searchQuery else { return }
       // OCR or an edit can change a title while its immutable snapshot is searched.
-      guard zip(snapshot, documents).allSatisfy({ $0.title == $1.title }) else {
+      guard zip(snapshot, documents).allSatisfy({ $0.searchDocument.revision == $1.revision }) else {
         scheduleSearch()
         return
       }
