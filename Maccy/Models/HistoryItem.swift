@@ -166,6 +166,11 @@ class HistoryItem {
     return data
   }
 
+  // Checking image presence must not decode and retain every image in the list.
+  var hasImage: Bool {
+    contents.contains { Self.imageTypes.contains(NSPasteboard.PasteboardType($0.type)) } || universalClipboardImage
+  }
+
   var image: NSImage? {
     if let img = cachedDecodedImage {
       return img
@@ -188,6 +193,7 @@ class HistoryItem {
   }
 
   func clearDecodedImageCache() {
+    guard cachedDecodedImage != nil else { return }
     cachedDecodedImage?.recache()
     cachedDecodedImage = nil
   }
@@ -236,6 +242,7 @@ class HistoryItem {
       return
     }
 
+    defer { clearDecodedImageCache() }
     let requestHandler = VNImageRequestHandler(cgImage: cgImage)
     let request = VNRecognizeTextRequest(completionHandler: recognizeTextHandler)
     request.recognitionLevel = .fast

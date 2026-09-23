@@ -233,6 +233,67 @@ class SearchTests: XCTestCase {
     XCTAssertEqual(search("m"), [])
   }
 
+  func testSnapshotSearchUnicodeAndInvalidRegex() {
+    let title = "你好 👩🏽‍💻 café CAFE"
+    let document = Search.Document(id: UUID(), title: title)
+    for (query, mode) in [("👩🏽‍💻", Search.Mode.exact), ("c.fé", .regexp), ("你好", .fuzzy)] {
+      let matches = Search.search(string: query, documents: [document], mode: mode)
+      XCTAssertEqual(matches.count, 1)
+      XCTAssertEqual(matches.first?.id, document.id)
+      for range in matches[0].ranges {
+        XCTAssertFalse(String(title[range]).isEmpty)
+      }
+    }
+    XCTAssertTrue(Search.search(string: "[", documents: [document], mode: .regexp).isEmpty)
+    XCTAssertEqual(Search.search(string: "cafe", documents: [document], mode: .exact).count, 1)
+  }
+
+  func testMixedFallbackPreservesPriority() {
+    let documents = ["foo", "f.o", "fob"].map { Search.Document(id: UUID(), title: $0) }
+    XCTAssertEqual(Search.search(string: "f.o", documents: documents, mode: .mixed).map(\.id),
+                   [documents[1].id])
+    XCTAssertEqual(Search.search(string: "^foo", documents: documents, mode: .mixed).map(\.id),
+                   [documents[0].id])
+    XCTAssertFalse(Search.search(string: "fbo", documents: documents, mode: .mixed).isEmpty)
+  }
+
+  func testCancellationDiscardsPartialMatches() {
+    let documents = (0..<100).map { Search.Document(id: UUID(), title: "entry \($0)") }
+    for mode in Search.Mode.allCases {
+      var checks = 0
+      let matches = Search.search(string: "entry", documents: documents, mode: mode) {
+        checks += 1
+        return checks > 10
+      }
+      XCTAssertTrue(matches.isEmpty)
+      XCTAssertLessThan(checks, documents.count)
+    }
+  }
+
+  func testFuzzyWindowKeepsValidUnicodeIndices() {
+    let title = "你好 " + String(repeating: "a", count: 6_000)
+    let document = Search.Document(id: UUID(), title: title)
+    let matches = Search.search(string: "你好", documents: [document], mode: .fuzzy)
+    XCTAssertEqual(matches.count, 1)
+    XCTAssertEqual(String(title[matches[0].ranges[0]]), "你好")
+  }
+
+  func testSearch9999EntriesOffMainThread() async {
+    let documents = (0..<9_999).map {
+      Search.Document(id: UUID(), title: "Clipboard entry \($0): 开发记录 café " + String(repeating: "text ", count: 12))
+    }
+    for mode in Search.Mode.allCases {
+      let result = await Task.detached {
+        let start = ContinuousClock.now
+        let matches = Search.search(string: "Clipboard", documents: documents, mode: mode)
+        return (matches.count, Thread.isMainThread, start.duration(to: .now))
+      }.value
+      XCTAssertEqual(result.0, 9_999)
+      XCTAssertFalse(result.1)
+      print("SEARCH_BENCHMARK 9999 entries mode=\(mode.rawValue) duration=\(result.2)")
+    }
+  }
+
   private func search(_ string: String) -> [Search.SearchResult] {
     return Search().search(string: string, within: items)
   }

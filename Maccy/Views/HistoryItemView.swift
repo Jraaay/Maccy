@@ -24,6 +24,8 @@ struct HistoryItemView: View {
 
   @Default(.showHexColorSwatch) private var showHexColorSwatch
   @Environment(AppState.self) private var appState
+  @Environment(\.scenePhase) private var scenePhase
+  @State private var rowIsVisible = false
 
   private var colorSwatchImage: NSImage? {
     guard showHexColorSwatch else { return nil }
@@ -60,7 +62,15 @@ struct HistoryItemView: View {
     .accessibilityIdentifier("copy-history-item")
     .buttonAction(performSelect)
     .onAppear {
+      rowIsVisible = true
       item.ensureThumbnailImage()
+    }
+    .onDisappear {
+      rowIsVisible = false
+      item.cleanupImages()
+    }
+    .onChange(of: scenePhase) {
+      if scenePhase == .active && rowIsVisible { item.ensureThumbnailImage() }
     }
     .accessibilityAction(named: Text(item.isPinned ? "history_item_unpin_action" : "history_item_pin_action")) {
       appState.history.togglePin(item)

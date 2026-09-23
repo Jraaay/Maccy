@@ -24,13 +24,11 @@ extension NSImage {
       return self
     }
 
-    return NSImage(size: newSize, flipped: false) { destRect in
-      if let context = NSGraphicsContext.current {
-        context.imageInterpolation = .high
-        self.draw(in: destRect, from: NSRect.zero, operation: .copy, fraction: 1)
-      }
-
-      return true
-    }
+    let result = NSImage(size: newSize)
+    result.lockFocus()
+    NSGraphicsContext.current?.imageInterpolation = .high
+    draw(in: NSRect(origin: .zero, size: newSize), from: .zero, operation: .copy, fraction: 1)
+    result.unlockFocus()
+    return result
   }
 }

@@ -19,14 +19,6 @@ struct HistoryListView: View {
   private var unpinnedItems: [HistoryItemDecorator] {
     appState.history.unpinnedItems.filter(\.isVisible)
   }
-  private var showPinsSeparator: Bool {
-    pinsVisible && !unpinnedItems.isEmpty
-  }
-
-  private var pinsVisible: Bool {
-    return !pinnedItems.isEmpty
-  }
-
   private var pasteStackVisible: Bool {
     if let stack = appState.history.pasteStack,
        !stack.items.isEmpty {
@@ -66,6 +58,9 @@ struct HistoryListView: View {
   }
 
   var body: some View {
+    let pinnedItems = self.pinnedItems
+    let unpinnedItems = self.unpinnedItems
+    let pinsVisible = !pinnedItems.isEmpty
     let topPinsVisible = pinTo == .top && pinsVisible
     let bottomPinsVisible = pinTo == .bottom && pinsVisible
     let historyEmpty = unpinnedItems.isEmpty

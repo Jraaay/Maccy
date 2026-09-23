@@ -21,17 +21,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   var searchQuery: String = "" {
     didSet {
-      throttler.throttle { [self] in
-        updateItems(search.search(string: searchQuery, within: all))
-
-        if searchQuery.isEmpty {
-          AppState.shared.navigator.select(item: unpinnedItems.first)
-        } else {
-          AppState.shared.navigator.highlightFirst()
-        }
-
-        AppState.shared.popup.needsResize = true
-      }
+      guard searchQuery != oldValue else { return }
+      scheduleSearch()
     }
   }
 
@@ -52,9 +43,11 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     return items.first { $0.shortcuts.contains(where: { $0.key == key }) }
   }
 
-  private let search = Search()
   private let sorter = Sorter()
-  private let throttler = Throttler(minimumDelay: 0.2)
+  @ObservationIgnored private var searchTask: Task<Void, Never>?
+  @ObservationIgnored private var searchWorker: Task<[Search.Match], Never>?
+  @ObservationIgnored private var searchGeneration = 0
+  @ObservationIgnored private var shortcutItems: [HistoryItemDecorator] = []
 
   @ObservationIgnored
   private var sessionLog: [Int: HistoryItem] = [:]
@@ -63,9 +56,23 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   // - `all` stores all history items, even the ones that are currently hidden by a search
   // - `items` stores only visible history items, updated during a search
   @ObservationIgnored
-  var all: [HistoryItemDecorator] = []
+  var all: [HistoryItemDecorator] = [] {
+    didSet {
+      // Invalidate in-flight results when entries are inserted, removed or reordered.
+      searchGeneration += 1
+      searchTask?.cancel()
+      searchWorker?.cancel()
+      if !searchQuery.isEmpty { scheduleSearch() }
+    }
+  }
 
   init() {
+    Task {
+      for await _ in Defaults.updates(.searchMode, initial: false) {
+        scheduleSearch()
+      }
+    }
+
     Task {
       for await _ in Defaults.updates(.pasteByDefault, initial: false) {
         updateShortcuts()
@@ -321,6 +328,18 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   }
 
   @MainActor
+  func releaseImageCaches() {
+    // Closing an NSPanel does not necessarily dismantle its SwiftUI rows.
+    for item in all {
+      if item.thumbnailImage != nil || item.previewImage != nil ||
+          item.thumbnailImageGenerationTask != nil || item.previewImageGenerationTask != nil {
+        item.cleanupImages()
+      }
+      item.item.clearDecodedImageCache()
+    }
+  }
+
+  @MainActor
   private func cleanup(_ item: HistoryItemDecorator) {
     item.cleanupImages()
   }
@@ -485,15 +504,53 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     return nil
   }
 
-  private func updateItems(_ newItems: [Search.SearchResult]) {
-    items = newItems.map { result in
-      let item = result.object
-      item.highlight(searchQuery, result.ranges)
-
-      return item
+  private func scheduleSearch() {
+    searchTask?.cancel()
+    searchWorker?.cancel()
+    searchGeneration += 1
+    let generation = searchGeneration
+    searchTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      let query = searchQuery
+      // Coalesce rapid keystrokes, but clear the search immediately.
+      if !query.isEmpty {
+        do { try await Task.sleep(for: .milliseconds(40)) } catch { return }
+      }
+      guard !Task.isCancelled, generation == searchGeneration else { return }
+      let mode = Defaults[.searchMode]
+      let snapshot = all
+      let documents = snapshot.map { Search.Document(id: $0.id, title: $0.title) }
+      let matches: [Search.Match]
+      if query.isEmpty {
+        matches = documents.map { Search.Match(id: $0.id) }
+      } else {
+        let worker = Task.detached(priority: .userInitiated) {
+          Search.search(string: query, documents: documents, mode: mode, isCancelled: { Task.isCancelled })
+        }
+        searchWorker = worker
+        matches = await worker.value
+      }
+      guard !Task.isCancelled, generation == searchGeneration, query == searchQuery else { return }
+      // OCR or an edit can change a title while its immutable snapshot is searched.
+      guard zip(snapshot, documents).allSatisfy({ $0.title == $1.title }) else {
+        scheduleSearch()
+        return
+      }
+      let objects = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0) })
+      items = matches.compactMap { match in
+        guard let item = objects[match.id] else { return nil }
+        item.highlight(query, match.ranges)
+        return item
+      }
+      updateUnpinnedShortcuts()
+      if query.isEmpty {
+        AppState.shared.navigator.select(item: items.first(where: \.isUnpinned))
+      } else {
+        AppState.shared.navigator.highlightFirst()
+      }
+      AppState.shared.popup.needsResize = true
+      searchWorker = nil
     }
-
-    updateUnpinnedShortcuts()
   }
 
   private func updateShortcuts() {
@@ -510,18 +567,21 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   private func updateTitle(item: HistoryItemDecorator, title: String) {
     item.title = title
     item.item.title = title
+    if !searchQuery.isEmpty { scheduleSearch() }
   }
 
   private func updateUnpinnedShortcuts() {
-    let visibleUnpinnedItems = unpinnedItems.filter(\.isVisible)
-    for item in visibleUnpinnedItems {
+    let next = Array(items.lazy.filter { $0.isUnpinned && $0.isVisible }.prefix(9))
+    for item in shortcutItems where item.isUnpinned && !next.contains(item) {
       item.shortcuts = []
     }
-
-    var index = 1
-    for item in visibleUnpinnedItems.prefix(9) {
-      item.shortcuts = KeyShortcut.create(character: String(index))
-      index += 1
+    for (index, item) in next.enumerated() {
+      let shortcuts = KeyShortcut.create(character: String(index + 1))
+      if item.shortcuts.map(\.key) != shortcuts.map(\.key) ||
+          item.shortcuts.map(\.modifierFlags) != shortcuts.map(\.modifierFlags) {
+        item.shortcuts = shortcuts
+      }
     }
+    shortcutItems = next
   }
 }

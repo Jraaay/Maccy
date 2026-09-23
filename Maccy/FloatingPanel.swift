@@ -209,6 +209,7 @@ class FloatingPanel<Content: View>: NSPanel, NSWindowDelegate {
   override func close() {
     super.close()
     AppState.shared.preview.state = .closed
+    AppState.shared.history.releaseImageCaches()
     isPresented = false
     statusBarButton?.isHighlighted = false
     onClose()

@@ -15,8 +15,29 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
 
   let id = UUID()
 
-  var title: String = ""
-  var attributedTitle: AttributedString?
+  var title: String = "" {
+    didSet {
+      guard title != oldValue else { return }
+      cachedAttributedTitle = nil
+      highlightRanges = []
+    }
+  }
+  private var highlightRanges: [Range<String.Index>] = []
+  private var isHighlighted = false
+  @ObservationIgnored private var cachedAttributedTitle: AttributedString?
+  @ObservationIgnored private var cachedHighlightStyle: HighlightMatch?
+
+  // SwiftUI's lazy rows only request this for content being rendered.
+  var attributedTitle: AttributedString? {
+    guard isHighlighted, !title.isEmpty else { return nil }
+    let ranges = highlightRanges
+    let style = Defaults[.highlightMatch]
+    if let cachedAttributedTitle, cachedHighlightStyle == style { return cachedAttributedTitle }
+    let value = makeAttributedTitle(ranges, style: style)
+    cachedHighlightStyle = style
+    cachedAttributedTitle = value
+    return value
+  }
 
   var isVisible: Bool = true
   var selectionIndex: Int = -1
@@ -39,7 +60,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
     return url.deletingPathExtension().lastPathComponent
   }
 
-  var hasImage: Bool { item.image != nil }
+  var hasImage: Bool { item.hasImage }
 
   var previewImageGenerationTask: Task<(), Error>?
   var thumbnailImageGenerationTask: Task<(), Error>?
@@ -57,10 +78,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   var isUnpinned: Bool { item.pin == nil }
 
   func hash(into hasher: inout Hasher) {
-    // We need to hash title and attributedTitle, so SwiftUI knows it needs to update the view if they chage
     hasher.combine(id)
-    hasher.combine(title)
-    hasher.combine(attributedTitle)
   }
 
   private(set) var item: HistoryItem
@@ -105,7 +123,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
 
   @MainActor
   func ensureThumbnailImage() {
-    guard item.image != nil else {
+    guard hasImage else {
       return
     }
     guard thumbnailImage == nil else {
@@ -115,13 +133,14 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
       return
     }
     thumbnailImageGenerationTask = Task { [weak self] in
+      guard !Task.isCancelled else { return }
       self?.generateThumbnailImage()
     }
   }
 
   @MainActor
   func ensurePreviewImage() {
-    guard item.image != nil else {
+    guard hasImage else {
       return
     }
     guard previewImage == nil else {
@@ -131,6 +150,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
       return
     }
     previewImageGenerationTask = Task { [weak self] in
+      guard !Task.isCancelled else { return }
       self?.generatePreviewImage()
     }
   }
@@ -149,6 +169,8 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   func cleanupImages() {
     thumbnailImageGenerationTask?.cancel()
     previewImageGenerationTask?.cancel()
+    thumbnailImageGenerationTask = nil
+    previewImageGenerationTask = nil
     thumbnailImage?.recache()
     previewImage?.recache()
     thumbnailImage = nil
@@ -162,6 +184,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
       return
     }
     thumbnailImage = image.resized(to: HistoryItemDecorator.thumbnailImageSize)
+    item.clearDecodedImageCache()
   }
 
   @MainActor
@@ -170,6 +193,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
       return
     }
     previewImage = image.resized(to: HistoryItemDecorator.previewImageSize)
+    item.clearDecodedImageCache()
   }
 
   @MainActor
@@ -179,16 +203,19 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   }
 
   func highlight(_ query: String, _ ranges: [Range<String.Index>]) {
-    guard !query.isEmpty, !title.isEmpty else {
-      attributedTitle = nil
-      return
-    }
+    let active = !query.isEmpty
+    guard isHighlighted != active || highlightRanges != ranges else { return }
+    cachedAttributedTitle = nil
+    isHighlighted = active
+    highlightRanges = ranges
+  }
 
+  private func makeAttributedTitle(_ ranges: [Range<String.Index>], style: HighlightMatch) -> AttributedString {
     var attributedString = AttributedString(title.shortened(to: 500))
     for range in ranges {
       if let lowerBound = AttributedString.Index(range.lowerBound, within: attributedString),
          let upperBound = AttributedString.Index(range.upperBound, within: attributedString) {
-        switch Defaults[.highlightMatch] {
+        switch style {
         case .bold:
           attributedString[lowerBound..<upperBound].font = .bold(.body)()
         case .italic:
@@ -202,13 +229,14 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
       }
     }
 
-    attributedTitle = attributedString
+    return attributedString
   }
 
   @MainActor
   func togglePin() {
     if item.pin != nil {
       item.pin = nil
+      shortcuts = []
     } else {
       let pin = HistoryItem.randomAvailablePin
       item.pin = pin
@@ -218,8 +246,9 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   private func synchronizeItemPin() {
     _ = withObservationTracking {
       item.pin
-    } onChange: {
-      DispatchQueue.main.async {
+    } onChange: { [weak self] in
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
         if let pin = self.item.pin {
           self.shortcuts = KeyShortcut.create(character: pin)
         }
@@ -231,8 +260,9 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   private func synchronizeItemTitle() {
     _ = withObservationTracking {
       item.title
-    } onChange: {
-      DispatchQueue.main.async {
+    } onChange: { [weak self] in
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
         self.title = self.item.title
         self.synchronizeItemTitle()
       }
