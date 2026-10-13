@@ -1,0 +1,151 @@
+diff --git a/Maccy/Clipboard.swift b/Maccy/Clipboard.swift
+index 114ee62..673e7d5 100644
+--- a/Maccy/Clipboard.swift
++++ b/Maccy/Clipboard.swift
+@@ -331,3 +331,9 @@ class Clipboard {
+     return newContents
+   }
+ }
++
++#if DEBUG
++extension Clipboard {
++  func stopForBenchmark() { timer?.invalidate(); timer = nil; clearHooks() }
++}
++#endif
+diff --git a/Maccy/Observables/History.swift b/Maccy/Observables/History.swift
+index 18510f7..b115003 100644
+--- a/Maccy/Observables/History.swift
++++ b/Maccy/Observables/History.swift
+@@ -585,3 +585,9 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
+     shortcutItems = next
+   }
+ }
++
++#if DEBUG
++extension History {
++  func awaitSearchForBenchmark() async { await searchTask?.value }
++}
++#endif
+diff --git a/MaccyTests/SearchTests.swift b/MaccyTests/SearchTests.swift
+index 3eff396..7c4175e 100644
+--- a/MaccyTests/SearchTests.swift
++++ b/MaccyTests/SearchTests.swift
+@@ -294,6 +294,118 @@ class SearchTests: XCTestCase {
+     }
+   }
+ 
++  // One-off benchmark, run with -O and DEBUG so preferences and storage stay isolated.
++  @MainActor
++  func testExactSearchScalingBenchmark() async throws {
++    Clipboard.shared.stopForBenchmark()
++    AppState.shared.preview.disableAutoOpen()
++    AppState.shared.appDelegate?.panel.orderOut(nil)
++    Defaults[.searchMode] = .exact
++    try await Task.sleep(for: .milliseconds(200))
++    let counts = [100, 500, 1_000, 2_500, 5_000, 9_999]
++    let modes = ["all", "sparse", "none"]
++    let filler = "开发记录 café 👩🏽‍💻 project example https://example.invalid/path 配置文本 abcdefghijk "
++    func documents(length: Int) -> [Search.Document] {
++      (0..<9_999).map { index in
++        let tail = index % 100 == 0 ? "目标tokenA" : "普通tokenB"
++        let head = "Clipboard \(index): "
++        let body = String(String(repeating: filler, count: 30).prefix(length - head.count - tail.count))
++        return Search.Document(id: UUID(), title: head + body + tail)
++      }
++    }
++    func query(_ mode: String, _ iteration: Int) -> String {
++      switch mode {
++      case "all": return iteration.isMultiple(of: 2) ? "clipboard" : "CLIPBOARD"
++      case "sparse": return iteration.isMultiple(of: 2) ? "目标tokenA" : "目标TOKENa"
++      default: return iteration.isMultiple(of: 2) ? "__no_match_123__" : "__NO_MATCH_123__"
++      }
++    }
++    func expected(_ mode: String, _ count: Int) -> Int {
++      mode == "all" ? count : (mode == "sparse" ? (count + 99) / 100 : 0)
++    }
++    func milliseconds(_ duration: Duration) -> Double {
++      Double(duration.components.seconds) * 1_000 + Double(duration.components.attoseconds) / 1e15
++    }
++    func row(_ kind: String, _ length: Int, _ count: Int, _ mode: String, _ samples: [Double]) -> [String: Any] {
++      let ordered = samples.sorted()
++      return ["kind": kind, "title_characters": length, "entries": count, "case": mode,
++              "matches": expected(mode, count), "samples": samples,
++              "median_ms": (ordered[(ordered.count - 1) / 2] + ordered[ordered.count / 2]) / 2,
++              "p95_ms": ordered[Int(ceil(Double(ordered.count) * 0.95)) - 1],
++              "min_ms": ordered.first!, "max_ms": ordered.last!]
++    }
++    var rows: [[String: Any]] = []
++    for length in [100, 1_000] {
++      let full = documents(length: length)
++      for count in counts {
++        let dataset = Array(full.prefix(count))
++        for mode in modes {
++          let queries = (-5..<50).map { query(mode, $0) }
++          let expectedCount = expected(mode, count)
++          let timings = await Task.detached(priority: .userInitiated) {
++            var samples: [Double] = []
++            for (sampleIndex, searchQuery) in queries.enumerated() {
++              let elapsed = autoreleasepool {
++                let start = ContinuousClock.now
++                let matches = Search.search(string: searchQuery, documents: dataset,
++                                            mode: .exact, isCancelled: { Task.isCancelled })
++                let elapsed = start.duration(to: .now).components
++                precondition(matches.count == expectedCount)
++                precondition(!Thread.isMainThread)
++                return Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15
++              }
++              if sampleIndex >= 5 { samples.append(elapsed) }
++            }
++            return samples
++          }.value
++          rows.append(row("matching", length, count, mode, timings))
++        }
++        print("BENCH_PROGRESS matching length=\(length) entries=\(count)")
++      }
++    }
++    // Await the actual History search task, including debounce, snapshots, worker,
++    // result publication, shortcuts and selection; this is not a rendered-frame metric.
++    let history = History.shared
++    for length in [100, 1_000] {
++      let decorators = documents(length: length).map { document in
++        let item = HistoryItem()
++        item.title = document.title
++        return HistoryItemDecorator(item)
++      }
++      for count in counts {
++        history.searchQuery = ""
++        await history.awaitSearchForBenchmark()
++        history.all = Array(decorators.prefix(count))
++        history.items = history.all
++        for mode in modes {
++          var samples: [Double] = []
++          for iteration in -3..<20 {
++            let start = ContinuousClock.now
++            history.searchQuery = query(mode, iteration)
++            await history.awaitSearchForBenchmark()
++            let elapsed = milliseconds(start.duration(to: .now))
++            XCTAssertEqual(history.items.count, expected(mode, count))
++            if iteration >= 0 { samples.append(elapsed) }
++          }
++          rows.append(row("pipeline_including_40ms", length, count, mode, samples))
++        }
++        print("BENCH_PROGRESS pipeline length=\(length) entries=\(count)")
++      }
++      history.searchQuery = ""
++      await history.awaitSearchForBenchmark()
++      history.all = []
++      history.items = []
++    }
++    let result: [String: Any] = [
++      "commit": "112e15d", "compiler": "Swift -O with DEBUG isolation", "counts": counts,
++      "engine_samples": 50, "engine_warmups": 5, "pipeline_samples": 20, "pipeline_warmups": 3,
++      "rows": rows
++    ]
++    let output = URL(fileURLWithPath: "/tmp/maccy-exact-benchmark-results-20260923.json")
++    try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: output)
++    print("BENCH_COMPLETE \(output.path)")
++  }
++
+   private func search(_ string: String) -> [Search.SearchResult] {
+     return Search().search(string: string, within: items)
+   }

@@ -131,6 +131,91 @@ class HistoryItemDecoratorTests: XCTestCase {
     XCTAssertEqual(itemDecorator.attributedTitle, nil)
   }
 
+  func testDecoratorIsReleasedWhileModelRemainsAlive() {
+    let model = HistoryItem()
+    Storage.shared.context.insert(model)
+    weak var released: HistoryItemDecorator?
+    autoreleasepool {
+      let decorator = HistoryItemDecorator(model)
+      released = decorator
+      XCTAssertNotNil(released)
+    }
+    XCTAssertNil(released, "Observation callbacks must not retain the decorator")
+    model.title = "still usable"
+  }
+
+  func testHighlightInvalidatesAfterTitleChanges() {
+    let decorator = historyItemDecorator("foo bar")
+    decorator.highlight("foo", [range(from: 0, to: 2, in: decorator)])
+    XCTAssertNotNil(decorator.attributedTitle)
+    decorator.title = "new"
+    XCTAssertEqual(String(decorator.attributedTitle!.characters), "new")
+  }
+
+  func testSearchSnapshotChangesOnlyWhenTitleBytesChange() {
+    let decorator = historyItemDecorator("é")
+    let initial = decorator.searchDocument
+    XCTAssertEqual(decorator.searchDocument.revision, initial.revision)
+    decorator.title = "é"
+    XCTAssertEqual(decorator.searchDocument.revision, initial.revision)
+    decorator.title = "e\u{301}"
+    XCTAssertNotEqual(decorator.searchDocument.revision, initial.revision)
+    XCTAssertEqual(Array(decorator.searchDocument.title.utf8), Array("e\u{301}".utf8))
+    XCTAssertEqual(initial.title.utf8.count, 2, "The old snapshot must remain immutable")
+  }
+
+  func testHashIsStableAcrossHighlightChanges() {
+    let decorator = historyItemDecorator("foo bar")
+    let set: Set = [decorator]
+    decorator.highlight("foo", [range(from: 0, to: 2, in: decorator)])
+    XCTAssertTrue(set.contains(decorator))
+    decorator.title = "different"
+    XCTAssertTrue(set.contains(decorator))
+  }
+
+  func testThumbnailCanRegenerateAfterCleanup() async {
+    let decorator = historyItemDecorator(NSImage(named: "NSApplicationIcon")!)
+    decorator.ensureThumbnailImage()
+    _ = await decorator.thumbnailImageGenerationTask?.result
+    XCTAssertNotNil(decorator.thumbnailImage)
+    decorator.cleanupImages()
+    XCTAssertNil(decorator.thumbnailImage)
+    XCTAssertNil(decorator.thumbnailImageGenerationTask)
+    decorator.ensureThumbnailImage()
+    _ = await decorator.thumbnailImageGenerationTask?.result
+    XCTAssertNotNil(decorator.thumbnailImage)
+  }
+
+  func testClosingPreviewReleasesItButKeepsTheThumbnail() async {
+    let decorator = historyItemDecorator(NSImage(named: "NSApplicationIcon")!)
+    decorator.sizeImages()
+    let thumbnail = decorator.thumbnailImage
+    XCTAssertNotNil(decorator.previewImage)
+    decorator.cleanupPreviewImage()
+    XCTAssertNil(decorator.previewImage)
+    XCTAssertTrue(decorator.thumbnailImage === thumbnail)
+    decorator.ensurePreviewImage()
+    _ = await decorator.previewImageGenerationTask?.result
+    XCTAssertNotNil(decorator.previewImage)
+  }
+
+  func testResizedImageDoesNotRetainSource() {
+    weak var source: NSImage?
+    var resized: NSImage?
+    autoreleasepool {
+      let image = NSImage(size: NSSize(width: 400, height: 400), flipped: false) { rect in
+        NSColor.red.setFill()
+        rect.fill()
+        return true
+      }
+      source = image
+      resized = image.resized(to: NSSize(width: 40, height: 40))
+    }
+    XCTAssertNil(source)
+    XCTAssertEqual(resized?.size, NSSize(width: 40, height: 40))
+    XCTAssertNotNil(resized?.tiffRepresentation)
+  }
+
   private func historyItemDecorator(
     _ value: String?,
     application: String? = "com.apple.finder"

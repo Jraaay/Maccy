@@ -1,0 +1,453 @@
+diff --git a/Maccy/Clipboard.swift b/Maccy/Clipboard.swift
+index 114ee62..673e7d5 100644
+--- a/Maccy/Clipboard.swift
++++ b/Maccy/Clipboard.swift
+@@ -331,3 +331,9 @@ class Clipboard {
+     return newContents
+   }
+ }
++
++#if DEBUG
++extension Clipboard {
++  func stopForBenchmark() { timer?.invalidate(); timer = nil; clearHooks() }
++}
++#endif
+diff --git a/Maccy/Observables/History.swift b/Maccy/Observables/History.swift
+index 18510f7..f0cf550 100644
+--- a/Maccy/Observables/History.swift
++++ b/Maccy/Observables/History.swift
+@@ -44,6 +44,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
+   }
+ 
+   private let sorter = Sorter()
++  @ObservationIgnored private let searchIndex = Search.Index()
++  @ObservationIgnored private var indexWarmupTask: Task<Void, Never>?
+   @ObservationIgnored private var searchTask: Task<Void, Never>?
+   @ObservationIgnored private var searchWorker: Task<[Search.Match], Never>?
+   @ObservationIgnored private var searchGeneration = 0
+@@ -59,6 +61,10 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
+   var all: [HistoryItemDecorator] = [] {
+     didSet {
+       // Invalidate in-flight results when entries are inserted, removed or reordered.
++      indexWarmupTask?.cancel()
++      let ids = Set(all.map(\.id))
++      let index = searchIndex
++      Task { await index.retain(documentIDs: ids) }
+       searchGeneration += 1
+       searchTask?.cancel()
+       searchWorker?.cancel()
+@@ -118,6 +124,10 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
+     limitHistorySize(to: Defaults[.size])
+ 
+     updateShortcuts()
++    let documents = all.map(\.searchDocument)
++    let index = searchIndex
++    indexWarmupTask?.cancel()
++    indexWarmupTask = Task.detached(priority: .utility) { await index.prepare(documents: documents) }
+     // Ensure that panel size is proper *after* loading all items.
+     Task {
+       AppState.shared.popup.needsResize = true
+@@ -505,6 +515,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
+   }
+ 
+   private func scheduleSearch() {
++    indexWarmupTask?.cancel()
+     searchTask?.cancel()
+     searchWorker?.cancel()
+     searchGeneration += 1
+@@ -512,27 +523,28 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
+     searchTask = Task { @MainActor [weak self] in
+       guard let self else { return }
+       let query = searchQuery
++      let mode = Defaults[.searchMode]
+       // Coalesce rapid keystrokes, but clear the search immediately.
+       if !query.isEmpty {
+-        do { try await Task.sleep(for: .milliseconds(40)) } catch { return }
++        do { try await Task.sleep(for: .milliseconds(mode == .exact ? 15 : 40)) } catch { return }
+       }
+       guard !Task.isCancelled, generation == searchGeneration else { return }
+-      let mode = Defaults[.searchMode]
+       let snapshot = all
+-      let documents = snapshot.map { Search.Document(id: $0.id, title: $0.title) }
++      let documents = snapshot.map(\.searchDocument)
+       let matches: [Search.Match]
+       if query.isEmpty {
+         matches = documents.map { Search.Match(id: $0.id) }
+       } else {
++        let index = searchIndex
+         let worker = Task.detached(priority: .userInitiated) {
+-          Search.search(string: query, documents: documents, mode: mode, isCancelled: { Task.isCancelled })
++          await index.search(string: query, documents: documents, mode: mode)
+         }
+         searchWorker = worker
+         matches = await worker.value
+       }
+       guard !Task.isCancelled, generation == searchGeneration, query == searchQuery else { return }
+       // OCR or an edit can change a title while its immutable snapshot is searched.
+-      guard zip(snapshot, documents).allSatisfy({ $0.title == $1.title }) else {
++      guard zip(snapshot, documents).allSatisfy({ $0.searchDocument.revision == $1.revision }) else {
+         scheduleSearch()
+         return
+       }
+@@ -585,3 +597,9 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
+     shortcutItems = next
+   }
+ }
++
++#if DEBUG
++extension History {
++  func awaitSearchForBenchmark() async { await searchTask?.value }
++}
++#endif
+diff --git a/Maccy/Observables/HistoryItemDecorator.swift b/Maccy/Observables/HistoryItemDecorator.swift
+index 6c6144d..9ddd03d 100644
+--- a/Maccy/Observables/HistoryItemDecorator.swift
++++ b/Maccy/Observables/HistoryItemDecorator.swift
+@@ -17,11 +17,22 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
+ 
+   var title: String = "" {
+     didSet {
+-      guard title != oldValue else { return }
++      // Canonically equivalent strings can have different encoded offsets.
++      guard !title.utf8.elementsEqual(oldValue.utf8) else { return }
++      cachedSearchDocument = nil
+       cachedAttributedTitle = nil
+       highlightRanges = []
+     }
+   }
++  @ObservationIgnored private var cachedSearchDocument: Search.Document?
++
++  var searchDocument: Search.Document {
++    if let cachedSearchDocument { return cachedSearchDocument }
++    let document = Search.Document(id: id, title: title)
++    cachedSearchDocument = document
++    return document
++  }
++
+   private var highlightRanges: [Range<String.Index>] = []
+   private var isHighlighted = false
+   @ObservationIgnored private var cachedAttributedTitle: AttributedString?
+diff --git a/Maccy/Search.swift b/Maccy/Search.swift
+index 79212d0..a0bd3c3 100644
+--- a/Maccy/Search.swift
++++ b/Maccy/Search.swift
+@@ -1,4 +1,5 @@
+ import AppKit
++import Darwin
+ import Defaults
+ import Fuse
+ 
+@@ -38,19 +39,131 @@ class Search {
+   struct Document: Sendable {
+     let id: UUID
+     let title: String
++    // Immutable snapshots carry an identity so warm searches need not rescan
++    // every title just to decide whether its index is still valid.
++    let revision = UUID()
+   }
+ 
+-  struct Match: Sendable {
++  struct Match: Sendable, Equatable {
+     let id: UUID
+     var score: Double?
+     var ranges: [Range<String.Index>] = []
+   }
+ 
++  // Confined to one actor: obsolete searches can be cancelled without racing
++  // updates to the cache. Only title text is indexed, never clipboard payloads.
++  actor Index {
++    private var entries: [UUID: IndexedTitle] = [:]
++
++    var documentCount: Int { entries.count }
++    var indexedByteCount: Int {
++      entries.values.reduce(0) { $0 + $1.bytes.count + $1.checkpoints.count * MemoryLayout<Checkpoint>.stride }
++    }
++
++    func prepare(documents: [Document]) {
++      retainCurrentDocuments(documents)
++      for document in documents {
++        guard !Task.isCancelled else { return }
++        _ = indexedTitle(for: document)
++      }
++    }
++
++    func search(string: String, documents: [Document], mode: Mode) -> [Match] {
++      guard !Task.isCancelled else { return [] }
++      retainCurrentDocuments(documents)
++      // Keep the original matcher for complex queries. In particular, expanding
++      // case folds (e.g. ß) and partial graphemes have different search semantics.
++      guard (mode == .exact || mode == .mixed), !string.isEmpty,
++            string.unicodeScalars.allSatisfy({
++              $0.isASCII || (0x3400...0x4DBF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value)
++            }) else {
++        return Search.search(string: string, documents: documents, mode: mode, isCancelled: { Task.isCancelled })
++      }
++      let needle = Self.fold(string)
++      return Search.search(
++        string: string, documents: documents, mode: mode, isCancelled: { Task.isCancelled },
++        candidateRange: { document in
++          let entry = self.indexedTitle(for: document)
++          guard let offset = entry.candidateUTF16Offset(for: needle) else { return nil }
++          let start = String.Index(utf16Offset: offset, in: document.title)
++          return start..<document.title.endIndex
++        }
++      )
++    }
++
++    func retain(documentIDs: Set<UUID>) {
++      entries = entries.filter { documentIDs.contains($0.key) }
++    }
++
++    private func retainCurrentDocuments(_ documents: [Document]) {
++      retain(documentIDs: Set(documents.map(\.id)))
++    }
++
++    private func indexedTitle(for document: Document) -> IndexedTitle {
++      if let entry = entries[document.id], entry.revision == document.revision { return entry }
++      let entry = autoreleasepool { IndexedTitle(document: document) }
++      entries[document.id] = entry
++      return entry
++    }
++
++    private static func fold(_ string: String) -> [UInt8] {
++      Array(string.folding(options: .caseInsensitive, locale: nil).decomposedStringWithCanonicalMapping.utf8)
++    }
++
++    private struct Checkpoint {
++      let byteOffset: Int
++      let utf16Offset: Int
++    }
++
++    private struct IndexedTitle {
++      let revision: UUID
++      var bytes: [UInt8] = []
++      var checkpoints: [Checkpoint] = []
++
++      init(document: Document) {
++        revision = document.revision
++        let title = document.title
++        var start = title.startIndex
++        var utf16Offset = 0
++        // Start verification at a known original grapheme boundary before the
++        // candidate. This preserves the original first match and its exact range.
++        while start < title.endIndex {
++          let end = title.index(start, offsetBy: 32, limitedBy: title.endIndex) ?? title.endIndex
++          let chunk = String(title[start..<end])
++          checkpoints.append(Checkpoint(byteOffset: bytes.count, utf16Offset: utf16Offset))
++          bytes.append(contentsOf: Index.fold(chunk))
++          utf16Offset += chunk.utf16.count
++          start = end
++        }
++      }
++
++      func candidateUTF16Offset(for needle: [UInt8]) -> Int? {
++        guard !needle.isEmpty, bytes.count >= needle.count else { return nil }
++        let offset: Int? = bytes.withUnsafeBytes { haystack in
++          needle.withUnsafeBytes { pattern in
++            guard let found = memmem(haystack.baseAddress!, haystack.count, pattern.baseAddress!, pattern.count) else {
++              return nil
++            }
++            return haystack.baseAddress!.distance(to: UnsafeRawPointer(found))
++          }
++        }
++        guard let offset else { return nil }
++        var lower = 0
++        var upper = checkpoints.count
++        while lower < upper {
++          let middle = (lower + upper) / 2
++          if checkpoints[middle].byteOffset <= offset { lower = middle + 1 } else { upper = middle }
++        }
++        return checkpoints[lower - 1].utf16Offset
++      }
++    }
++  }
++
+   func search(string: String, within: [Searchable]) -> [SearchResult] {
+     let objects = Dictionary(uniqueKeysWithValues: within.map { ($0.id, $0) })
+     return Self.search(
+       string: string,
+-      documents: within.map { Document(id: $0.id, title: $0.title) },
++      documents: within.map(\.searchDocument),
+       mode: Defaults[.searchMode]
+     ).compactMap { match in
+       guard let object = objects[match.id] else { return nil }
+@@ -62,20 +175,21 @@ class Search {
+     string: String,
+     documents: [Document],
+     mode: Mode,
+-    isCancelled: () -> Bool = { false }
++    isCancelled: () -> Bool = { false },
++    candidateRange: ((Document) -> Range<String.Index>?)? = nil
+   ) -> [Match] {
+     guard !isCancelled() else { return [] }
+     guard !string.isEmpty else { return documents.map { Match(id: $0.id) } }
+ 
+     switch mode {
+     case .exact:
+-      return exactSearch(string, documents, isCancelled)
++      return exactSearch(string, documents, isCancelled, candidateRange)
+     case .regexp:
+       return regexSearch(string, documents, isCancelled)
+     case .fuzzy:
+       return fuzzySearch(string, documents, isCancelled)
+     case .mixed:
+-      let exact = exactSearch(string, documents, isCancelled)
++      let exact = exactSearch(string, documents, isCancelled, candidateRange)
+       guard exact.isEmpty, !isCancelled() else { return exact }
+       let regex = regexSearch(string, documents, isCancelled)
+       guard regex.isEmpty, !isCancelled() else { return regex }
+@@ -84,12 +198,20 @@ class Search {
+   }
+ 
+   private static func exactSearch(
+-    _ query: String, _ documents: [Document], _ isCancelled: () -> Bool
++    _ query: String, _ documents: [Document], _ isCancelled: () -> Bool,
++    _ candidateRange: ((Document) -> Range<String.Index>?)?
+   ) -> [Match] {
+     var results: [Match] = []
+     for document in documents {
+       guard !isCancelled() else { return [] }
+-      if let range = document.title.range(of: query, options: .caseInsensitive) {
++      let bounds: Range<String.Index>
++      if let candidateRange {
++        guard let candidate = candidateRange(document) else { continue }
++        bounds = candidate
++      } else {
++        bounds = document.title.startIndex..<document.title.endIndex
++      }
++      if let range = document.title.range(of: query, options: .caseInsensitive, range: bounds) {
+         results.append(Match(id: document.id, ranges: [range]))
+       }
+     }
+diff --git a/MaccyTests/SearchTests.swift b/MaccyTests/SearchTests.swift
+index 3eff396..ee193ef 100644
+--- a/MaccyTests/SearchTests.swift
++++ b/MaccyTests/SearchTests.swift
+@@ -294,6 +294,127 @@ class SearchTests: XCTestCase {
+     }
+   }
+ 
++  // One-off benchmark, run with -O and DEBUG so preferences and storage stay isolated.
++  @MainActor
++  func testExactSearchScalingBenchmark() async throws {
++    Clipboard.shared.stopForBenchmark()
++    AppState.shared.preview.disableAutoOpen()
++    AppState.shared.appDelegate?.panel.orderOut(nil)
++    Defaults[.searchMode] = .exact
++    try await Task.sleep(for: .milliseconds(200))
++    let counts = [100, 500, 1_000, 2_500, 5_000, 9_999]
++    let modes = ["all", "sparse", "none"]
++    let filler = "开发记录 café 👩🏽‍💻 project example https://example.invalid/path 配置文本 abcdefghijk "
++    func documents(length: Int) -> [Search.Document] {
++      (0..<9_999).map { index in
++        let tail = index % 100 == 0 ? "目标tokenA" : "普通tokenB"
++        let head = "Clipboard \(index): "
++        let body = String(String(repeating: filler, count: 30).prefix(length - head.count - tail.count))
++        return Search.Document(id: UUID(), title: head + body + tail)
++      }
++    }
++    func query(_ mode: String, _ iteration: Int) -> String {
++      switch mode {
++      case "all": return iteration.isMultiple(of: 2) ? "clipboard" : "CLIPBOARD"
++      case "sparse": return iteration.isMultiple(of: 2) ? "目标tokenA" : "目标TOKENa"
++      default: return iteration.isMultiple(of: 2) ? "__no_match_123__" : "__NO_MATCH_123__"
++      }
++    }
++    func expected(_ mode: String, _ count: Int) -> Int {
++      mode == "all" ? count : (mode == "sparse" ? (count + 99) / 100 : 0)
++    }
++    func milliseconds(_ duration: Duration) -> Double {
++      Double(duration.components.seconds) * 1_000 + Double(duration.components.attoseconds) / 1e15
++    }
++    func row(_ kind: String, _ length: Int, _ count: Int, _ mode: String, _ samples: [Double]) -> [String: Any] {
++      let ordered = samples.sorted()
++      return ["kind": kind, "title_characters": length, "entries": count, "case": mode,
++              "matches": expected(mode, count), "samples": samples,
++              "median_ms": (ordered[(ordered.count - 1) / 2] + ordered[ordered.count / 2]) / 2,
++              "p95_ms": ordered[Int(ceil(Double(ordered.count) * 0.95)) - 1],
++              "min_ms": ordered.first!, "max_ms": ordered.last!]
++    }
++    var rows: [[String: Any]] = []
++    var indexCosts: [[String: Any]] = []
++    for length in [100, 1_000] {
++      let full = documents(length: length)
++      for count in counts {
++        let dataset = Array(full.prefix(count))
++        let index = Search.Index()
++        let prepareStart = ContinuousClock.now
++        await index.prepare(documents: dataset)
++        let prepareTime = milliseconds(prepareStart.duration(to: .now))
++        let coldIndex = Search.Index()
++        let coldStart = ContinuousClock.now
++        let coldResults = await coldIndex.search(string: "目标tokenA", documents: dataset, mode: .exact)
++        let coldTime = milliseconds(coldStart.duration(to: .now))
++        XCTAssertEqual(coldResults.count, expected("sparse", count))
++        let byteCount = await index.indexedByteCount
++        indexCosts.append(["title_characters": length, "entries": count, "prepare_ms": prepareTime,
++                           "cold_search_ms": coldTime, "indexed_bytes": byteCount])
++        for mode in modes {
++          let queries = (-5..<50).map { query(mode, $0) }
++          let expectedCount = expected(mode, count)
++          let timings = await Task.detached(priority: .userInitiated) {
++            var samples: [Double] = []
++            for (sampleIndex, searchQuery) in queries.enumerated() {
++              let start = ContinuousClock.now
++              let matches = await index.search(string: searchQuery, documents: dataset, mode: .exact)
++              let duration = start.duration(to: .now).components
++              precondition(matches.count == expectedCount)
++              let elapsed = Double(duration.seconds) * 1_000 + Double(duration.attoseconds) / 1e15
++              if sampleIndex >= 5 { samples.append(elapsed) }
++            }
++            return samples
++          }.value
++          rows.append(row("matching", length, count, mode, timings))
++        }
++        print("BENCH_PROGRESS matching length=\(length) entries=\(count)")
++      }
++    }
++    // Await the actual History search task, including debounce, snapshots, worker,
++    // result publication, shortcuts and selection; this is not a rendered-frame metric.
++    let history = History.shared
++    for length in [100, 1_000] {
++      let decorators = documents(length: length).map { document in
++        let item = HistoryItem()
++        item.title = document.title
++        return HistoryItemDecorator(item)
++      }
++      for count in counts {
++        history.searchQuery = ""
++        await history.awaitSearchForBenchmark()
++        history.all = Array(decorators.prefix(count))
++        history.items = history.all
++        for mode in modes {
++          var samples: [Double] = []
++          for iteration in -3..<20 {
++            let start = ContinuousClock.now
++            history.searchQuery = query(mode, iteration)
++            await history.awaitSearchForBenchmark()
++            let elapsed = milliseconds(start.duration(to: .now))
++            XCTAssertEqual(history.items.count, expected(mode, count))
++            if iteration >= 0 { samples.append(elapsed) }
++          }
++          rows.append(row("pipeline_including_15ms", length, count, mode, samples))
++        }
++        print("BENCH_PROGRESS pipeline length=\(length) entries=\(count)")
++      }
++      history.searchQuery = ""
++      await history.awaitSearchForBenchmark()
++      history.all = []
++      history.items = []
++    }
++    let result: [String: Any] = [
++      "commit": "112e15d + indexed-search working changes", "index_costs": indexCosts, "compiler": "Swift -O with DEBUG isolation", "counts": counts,
++      "engine_samples": 50, "engine_warmups": 5, "pipeline_samples": 20, "pipeline_warmups": 3,
++      "rows": rows
++    ]
++    let output = URL(fileURLWithPath: "/tmp/maccy-index-benchmark-results-20260923.json")
++    try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: output)
++    print("BENCH_COMPLETE \(output.path)")
++  }
++
+   private func search(_ string: String) -> [Search.SearchResult] {
+     return Search().search(string: string, within: items)
+   }

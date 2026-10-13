@@ -5,7 +5,7 @@ import SwiftUI
 
 class AppDelegate: NSObject, NSApplicationDelegate {
   nonisolated static let isTesting = CommandLine.arguments.contains("enable-testing")
-  var panel: FloatingPanel<ContentView>!
+  var panel: FloatingPanel!
 
   @objc
   private lazy var statusItem: NSStatusItem = {
@@ -34,6 +34,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private var statusItemVisibilityObserver: NSKeyValueObservation?
+  private var menuTextObservationGeneration = 0
 
   func applicationWillFinishLaunching(_ notification: Notification) { // swiftlint:disable:this function_body_length
     #if DEBUG
@@ -78,9 +79,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       }
     }
 
-    synchronizeMenuIconText()
     Task {
       for await value in Defaults.updates(.showRecentCopyInMenuBar) {
+        synchronizeMenuIconText()
         if value {
           statusItem.button?.title = AppState.shared.menuIconText
         } else {
@@ -202,10 +203,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   private func synchronizeMenuIconText() {
+    menuTextObservationGeneration += 1
+    let generation = menuTextObservationGeneration
+    guard Defaults[.showRecentCopyInMenuBar] else { return }
     _ = withObservationTracking {
       AppState.shared.menuIconText
-    } onChange: {
-      DispatchQueue.main.async {
+    } onChange: { [weak self] in
+      DispatchQueue.main.async { [weak self] in
+        guard let self, generation == self.menuTextObservationGeneration else { return }
         if Defaults[.showRecentCopyInMenuBar] {
           self.statusItem.button?.title = AppState.shared.menuIconText
         }

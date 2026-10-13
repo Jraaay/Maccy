@@ -3,7 +3,7 @@ import SwiftUI
 
 // An NSPanel subclass that implements floating panel traits.
 // https://stackoverflow.com/questions/46023769/how-to-show-a-window-without-stealing-focus-on-macos
-class FloatingPanel<Content: View>: NSPanel, NSWindowDelegate {
+class FloatingPanel: NSPanel, NSWindowDelegate {
   var isPresented: Bool = false
   var statusBarButton: NSStatusBarButton?
   let onClose: () -> Void
@@ -13,7 +13,8 @@ class FloatingPanel<Content: View>: NSPanel, NSWindowDelegate {
     set {}
   }
 
-  init(
+  // Keep the NSPanel subclass nongeneric to avoid Swift 6.3's deinit optimizer crash.
+  init<Content: View>(
     contentRect: NSRect,
     identifier: String = "",
     statusBarButton: NSStatusBarButton? = nil,
@@ -222,6 +223,7 @@ class FloatingPanel<Content: View>: NSPanel, NSWindowDelegate {
     appState.isEditingItem = false
     appState.navigator.isDragAndDropInProgress = false
     appState.navigator.isManualMultiSelect = false
+    appState.history.releaseImageCaches()
     isPresented = false
     statusBarButton?.isHighlighted = false
     onClose()

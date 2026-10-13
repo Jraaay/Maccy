@@ -35,19 +35,9 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   var firstUnpinnedItem: HistoryItemDecorator? { unpinnedItems.first }
 
   var searchQuery: String = "" {
-    didSet(previousSearchQuery) {
-      guard searchQuery != previousSearchQuery else { return }
-      throttler.throttle { [self] in
-        updateSearchResults()
-
-        if searchQuery.isEmpty {
-          AppState.shared.navigator.select(item: firstUnpinnedItem)
-        } else {
-          AppState.shared.navigator.highlightFirst()
-        }
-
-        AppState.shared.popup.needsResize = true
-      }
+    didSet {
+      guard searchQuery != oldValue else { return }
+      scheduleSearch()
     }
   }
 
@@ -68,14 +58,18 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     return items.first { $0.shortcuts.contains(where: { $0.key == key }) }
   }
 
-  private let search = Search()
   private let sorter = Sorter()
-  private let throttler = Throttler(minimumDelay: 0.2)
   private let pinManager = PinManager()
   private var allPinnedItems: [HistoryItemDecorator] { pinManager.pinnedItems }
   private var allUnpinnedItems: [HistoryItemDecorator] = []
   private var filteredPinnedItems: [HistoryItemDecorator] = []
   private var filteredUnpinnedItems: [HistoryItemDecorator] = []
+  @ObservationIgnored private let searchIndex = Search.Index()
+  @ObservationIgnored private var indexWarmupTask: Task<Void, Never>?
+  @ObservationIgnored private var searchTask: Task<Void, Never>?
+  @ObservationIgnored private var searchWorker: Task<[Search.Match], Never>?
+  @ObservationIgnored private var searchGeneration = 0
+  @ObservationIgnored private var shortcutItems: [HistoryItemDecorator] = []
 
   @ObservationIgnored
   private var sessionLog: [Int: HistoryItem] = [:]
@@ -84,10 +78,18 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   static let isRunningUnitTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 #endif
 
+  private var all: [HistoryItemDecorator] { allPinnedItems + allUnpinnedItems }
+
   init() {
     #if DEBUG
     guard !Self.isRunningUnitTests else { return }
     #endif
+
+    Task {
+      for await _ in Defaults.updates(.searchMode, initial: false) {
+        scheduleSearch()
+      }
+    }
 
     Task {
       for await _ in Defaults.updates(.pasteByDefault, initial: false) {
@@ -137,6 +139,11 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     limitHistorySize(to: Defaults[.size])
 
     updateShortcuts()
+    invalidateSearch()
+    let documents = all.map(\.searchDocument)
+    let index = searchIndex
+    indexWarmupTask?.cancel()
+    indexWarmupTask = Task.detached(priority: .utility) { await index.prepare(documents: documents) }
     // Ensure that panel size is proper *after* loading all items.
     Task {
       AppState.shared.popup.needsResize = true
@@ -161,6 +168,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   @discardableResult
   @MainActor
   func add(_ item: HistoryItem) -> HistoryItemDecorator {
+    defer { invalidateSearch() }
     if #available(macOS 15.0, *) {
       try? History.shared.insertIntoStorage(item)
     } else {
@@ -216,10 +224,9 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     if searchQuery.isEmpty {
       updateUnpinnedShortcuts()
-    } else {
-      updateSearchResults()
     }
     AppState.shared.popup.needsResize = true
+    Storage.shared.schedulePayloadCleanup()
     return itemDecorator
   }
 
@@ -238,6 +245,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func clear() {
+    defer { invalidateSearch() }
     withLogging("Clearing history") {
       allUnpinnedItems.forEach(cleanup)
       allUnpinnedItems.removeAll()
@@ -255,7 +263,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
         )
       }
       Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
+      try? Storage.shared.saveAndCleanPayloads(discardMigrationBackup: true)
     }
 
     Clipboard.shared.clear()
@@ -267,6 +275,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func clearAll() {
+    defer { invalidateSearch() }
     withLogging("Clearing all history") {
       allPinnedItems.forEach(cleanup)
       allUnpinnedItems.forEach(cleanup)
@@ -291,7 +300,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
         logger.error("Failed to clear storage: \(String(reflecting: error))")
       }
       Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
+      try? Storage.shared.saveAndCleanPayloads(discardMigrationBackup: true)
     }
 
     Clipboard.shared.clear()
@@ -303,13 +312,14 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func delete(_ item: HistoryItemDecorator?) {
+    defer { invalidateSearch() }
     guard let item else { return }
 
     cleanup(item)
     withLogging("Removing history item") {
       deleteFromStorage(item.item)
       Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
+      try? Storage.shared.saveAndCleanPayloads(discardMigrationBackup: true)
     }
 
     pinManager.remove(item)
@@ -343,6 +353,17 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   }
 
   @MainActor
+  func releaseImageCaches() {
+    // Closing an NSPanel does not necessarily dismantle its SwiftUI rows.
+    for item in all {
+      if item.thumbnailImage != nil || item.previewImage != nil ||
+          item.thumbnailImageGenerationTask != nil || item.previewImageGenerationTask != nil {
+        item.cleanupImages()
+      }
+    }
+  }
+
+  @MainActor
   private func cleanup(_ item: HistoryItemDecorator) {
     item.cleanupImages()
   }
@@ -355,7 +376,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     if modifierFlags.isEmpty {
       AppState.shared.popup.close()
-      Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault])
+      guard Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault]) else { return }
       if Defaults[.pasteByDefault] {
         Clipboard.shared.paste()
       }
@@ -363,14 +384,14 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
       switch HistoryItemAction(modifierFlags) {
       case .copy:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item)
+        guard Clipboard.shared.copy(item.item) else { return }
       case .paste:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item)
+        guard Clipboard.shared.copy(item.item) else { return }
         Clipboard.shared.paste()
       case .pasteWithoutFormatting:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item, removeFormatting: true)
+        guard Clipboard.shared.copy(item.item, removeFormatting: true) else { return }
         Clipboard.shared.paste()
       case .unknown:
         return
@@ -396,18 +417,18 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     if modifierFlags.isEmpty {
       AppState.shared.popup.close()
-      Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault])
+      guard Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault]) else { return }
     } else {
       switch HistoryItemAction(modifierFlags) {
       case .copy:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item)
+        guard Clipboard.shared.copy(item.item) else { return }
       case .paste:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item)
+        guard Clipboard.shared.copy(item.item) else { return }
       case .pasteWithoutFormatting:
         AppState.shared.popup.close()
-        Clipboard.shared.copy(item.item, removeFormatting: true)
+        guard Clipboard.shared.copy(item.item, removeFormatting: true) else { return }
         Clipboard.shared.paste()
       case .unknown:
         return
@@ -444,15 +465,15 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
     Task {
       if stack.modifierFlags.isEmpty {
-        await Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault])
+        guard await Clipboard.shared.copy(item.item, removeFormatting: Defaults[.removeFormattingByDefault]) else { pasteStack = nil; return }
       } else {
         switch HistoryItemAction(stack.modifierFlags) {
         case .copy:
-          await Clipboard.shared.copy(item.item)
+          guard await Clipboard.shared.copy(item.item) else { pasteStack = nil; return }
         case .paste:
-          await Clipboard.shared.copy(item.item)
+          guard await Clipboard.shared.copy(item.item) else { pasteStack = nil; return }
         case .pasteWithoutFormatting:
-          await Clipboard.shared.copy(item.item, removeFormatting: true)
+          guard await Clipboard.shared.copy(item.item, removeFormatting: true) else { pasteStack = nil; return }
         case .unknown:
           return
         }
@@ -470,6 +491,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func togglePin(_ item: HistoryItemDecorator?) {
+    defer { invalidateSearch() }
     guard let item else { return }
 
     let wasPinned = item.isPinned
@@ -491,12 +513,14 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func movePin(from source: IndexSet, to destination: Int) {
+    defer { invalidateSearch() }
     guard searchQuery.isEmpty else { return }
     pinManager.move(from: source, to: destination)
   }
 
   @MainActor
   func updatePin(_ item: HistoryItem, to pin: String) {
+    defer { invalidateSearch() }
     guard let itemDecorator = firstStoredItem(where: { $0.item.id == item.id }) else { return }
 
     let wasPinned = itemDecorator.isPinned
@@ -524,26 +548,6 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     return nil
   }
 
-  private func updateSearchResults() {
-    filteredPinnedItems = filteredItems(
-      from: search.search(string: searchQuery, within: allPinnedItems)
-    )
-    filteredUnpinnedItems = filteredItems(
-      from: search.search(string: searchQuery, within: allUnpinnedItems)
-    )
-
-    updateUnpinnedShortcuts()
-  }
-
-  private func filteredItems(from results: [Search.SearchResult]) -> [HistoryItemDecorator] {
-    results.map { result in
-      let item = result.object
-      item.highlight(searchQuery, result.ranges)
-
-      return item
-    }
-  }
-
   private func firstStoredItem(
     where predicate: (HistoryItemDecorator) -> Bool
   ) -> HistoryItemDecorator? {
@@ -554,6 +558,71 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     let sortedItems = sorter.sort(allUnpinnedItems.map(\.item) + [item.item])
     guard let index = sortedItems.firstIndex(of: item.item) else { return }
     allUnpinnedItems.insert(item, at: index)
+  }
+
+  private func invalidateSearch() {
+    indexWarmupTask?.cancel()
+    let ids = Set(all.map(\.id))
+    let index = searchIndex
+    Task { await index.retain(documentIDs: ids) }
+    searchGeneration += 1
+    searchTask?.cancel()
+    searchWorker?.cancel()
+    if !searchQuery.isEmpty || searchTask != nil { scheduleSearch() }
+  }
+
+  private func scheduleSearch() {
+    indexWarmupTask?.cancel()
+    searchTask?.cancel()
+    searchWorker?.cancel()
+    searchGeneration += 1
+    let generation = searchGeneration
+    searchTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      let query = searchQuery
+      let mode = Defaults[.searchMode]
+      // Coalesce rapid keystrokes, but clear the search immediately.
+      if !query.isEmpty {
+        do { try await Task.sleep(for: .milliseconds(mode == .exact ? 15 : 40)) } catch { return }
+      }
+      guard !Task.isCancelled, generation == searchGeneration else { return }
+      let snapshot = all
+      let documents = snapshot.map(\.searchDocument)
+      let matches: [Search.Match]
+      if query.isEmpty {
+        matches = documents.map { Search.Match(id: $0.id) }
+      } else {
+        let index = searchIndex
+        let worker = Task.detached(priority: .userInitiated) {
+          await index.search(string: query, documents: documents, mode: mode)
+        }
+        searchWorker = worker
+        matches = await worker.value
+      }
+      guard !Task.isCancelled, generation == searchGeneration, query == searchQuery else { return }
+      // OCR or an edit can change a title while its immutable snapshot is searched.
+      guard zip(snapshot, documents).allSatisfy({ $0.searchDocument.revision == $1.revision }) else {
+        scheduleSearch()
+        return
+      }
+      let objects = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0) })
+      let results = matches.compactMap { match -> HistoryItemDecorator? in
+        guard let item = objects[match.id] else { return nil }
+        item.highlight(query, match.ranges)
+        return item
+      }
+      filteredPinnedItems = results.filter(\.isPinned)
+      filteredUnpinnedItems = results.filter(\.isUnpinned)
+      updateUnpinnedShortcuts()
+      if query.isEmpty {
+        AppState.shared.navigator.select(item: items.first(where: \.isUnpinned))
+      } else {
+        AppState.shared.navigator.highlightFirst()
+      }
+      AppState.shared.popup.needsResize = true
+      searchWorker = nil
+      searchTask = nil
+    }
   }
 
   private func updateShortcuts() {
@@ -570,18 +639,21 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   private func updateTitle(item: HistoryItemDecorator, title: String) {
     item.title = title
     item.item.title = title
+    if !searchQuery.isEmpty { scheduleSearch() }
   }
 
   private func updateUnpinnedShortcuts() {
-    let shortcutItems = unpinnedItems.filter(\.isVisible)
-    for item in shortcutItems {
+    let next = Array(unpinnedItems.lazy.filter(\.isVisible).prefix(9))
+    for item in shortcutItems where item.isUnpinned && !next.contains(item) {
       item.shortcuts = []
     }
-
-    var index = 1
-    for item in shortcutItems.prefix(9) {
-      item.shortcuts = KeyShortcut.create(character: String(index))
-      index += 1
+    for (index, item) in next.enumerated() {
+      let shortcuts = KeyShortcut.create(character: String(index + 1))
+      if item.shortcuts.map(\.key) != shortcuts.map(\.key) ||
+          item.shortcuts.map(\.modifierFlags) != shortcuts.map(\.modifierFlags) {
+        item.shortcuts = shortcuts
+      }
     }
+    shortcutItems = next
   }
 }

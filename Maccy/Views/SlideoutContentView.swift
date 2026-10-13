@@ -5,15 +5,18 @@ struct SlideoutContentView: View {
 
   var body: some View {
     VStack {
-      ToolbarView()
+      if appState.preview.state != .closed {
+        ToolbarView()
 
-      if let item = appState.navigator.leadHistoryItem {
-        PreviewItemView(item: item)
-      } else if let pasteStack = appState.history.pasteStack,
-        appState.navigator.pasteStackSelected {
-        PasteStackPreviewView(pasteStack: pasteStack)
-      } else {
-        EmptyView()
+        if let item = appState.navigator.leadHistoryItem {
+          PreviewItemView(item: item)
+            .id(item.id)
+        } else if let pasteStack = appState.history.pasteStack,
+          appState.navigator.pasteStackSelected {
+          PasteStackPreviewView(pasteStack: pasteStack)
+        } else {
+          EmptyView()
+        }
       }
     }
     .padding(.horizontal)

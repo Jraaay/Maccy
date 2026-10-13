@@ -17,8 +17,40 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
 
   let id = UUID()
 
-  var title: String = ""
-  var attributedTitle: AttributedString?
+  var title: String = "" {
+    didSet {
+      // Canonically equivalent strings can have different encoded offsets.
+      guard !title.utf8.elementsEqual(oldValue.utf8) else { return }
+      cachedSearchDocument = nil
+      cachedAttributedTitle = nil
+      highlightRanges = []
+    }
+  }
+  @ObservationIgnored private var cachedSearchDocument: Search.Document?
+
+  var searchDocument: Search.Document {
+    if let cachedSearchDocument { return cachedSearchDocument }
+    let document = Search.Document(id: id, title: title)
+    cachedSearchDocument = document
+    return document
+  }
+
+  private var highlightRanges: [Range<String.Index>] = []
+  private var isHighlighted = false
+  @ObservationIgnored private var cachedAttributedTitle: AttributedString?
+  @ObservationIgnored private var cachedHighlightStyle: HighlightMatch?
+
+  // SwiftUI's lazy rows only request this for content being rendered.
+  var attributedTitle: AttributedString? {
+    guard isHighlighted, !title.isEmpty else { return nil }
+    let ranges = highlightRanges
+    let style = Defaults[.highlightMatch]
+    if let cachedAttributedTitle, cachedHighlightStyle == style { return cachedAttributedTitle }
+    let value = makeAttributedTitle(ranges, style: style)
+    cachedHighlightStyle = style
+    cachedAttributedTitle = value
+    return value
+  }
 
   var isVisible: Bool = true
   var selectionIndex: Int = -1
@@ -41,7 +73,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
     return url.deletingPathExtension().lastPathComponent
   }
 
-  var hasImage: Bool { item.image != nil }
+  var hasImage: Bool { item.hasImage }
   var hasFileURLs: Bool { !item.fileURLs.isEmpty }
   var hasPlainText: Bool { item.text != nil }
   var hasRichText: Bool { item.rtf != nil || item.html != nil }
@@ -60,10 +92,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   var isUnpinned: Bool { item.pin == nil }
 
   func hash(into hasher: inout Hasher) {
-    // We need to hash title and attributedTitle, so SwiftUI knows it needs to update the view if they chage
     hasher.combine(id)
-    hasher.combine(title)
-    hasher.combine(attributedTitle)
   }
 
   private(set) var item: HistoryItem
@@ -78,8 +107,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   // Describe the complete item independently of its potentially truncated visual content.
   var accessibilityLabel: String {
     var parts: [String] = []
-    if hasImage, let image = item.image {
-      let size = image.pixelSize
+    if hasImage, let size = item.imagePixelSize {
       parts.append(
         String(
           format: NSLocalizedString("history_item_image_accessibility_label_no_app", comment: ""),
@@ -121,7 +149,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
 
   @MainActor
   func ensureThumbnailImage() {
-    guard item.image != nil else {
+    guard hasImage else {
       return
     }
     guard thumbnailImage == nil else {
@@ -131,13 +159,14 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
       return
     }
     thumbnailImageGenerationTask = Task { [weak self] in
+      guard !Task.isCancelled else { return }
       self?.generateThumbnailImage()
     }
   }
 
   @MainActor
   func ensurePreviewImage() {
-    guard item.image != nil else {
+    guard hasImage else {
       return
     }
     guard previewImage == nil else {
@@ -147,6 +176,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
       return
     }
     previewImageGenerationTask = Task { [weak self] in
+      guard !Task.isCancelled else { return }
       self?.generatePreviewImage()
     }
   }
@@ -164,28 +194,28 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   @MainActor
   func cleanupImages() {
     thumbnailImageGenerationTask?.cancel()
-    previewImageGenerationTask?.cancel()
+    thumbnailImageGenerationTask = nil
     thumbnailImage?.recache()
-    previewImage?.recache()
     thumbnailImage = nil
+    cleanupPreviewImage()
+  }
+
+  @MainActor
+  func cleanupPreviewImage() {
+    previewImageGenerationTask?.cancel()
+    previewImageGenerationTask = nil
+    previewImage?.recache()
     previewImage = nil
-    item.clearDecodedImageCache()
   }
 
   @MainActor
   private func generateThumbnailImage() {
-    guard let image = item.image else {
-      return
-    }
-    thumbnailImage = image.resized(to: HistoryItemDecorator.thumbnailImageSize)
+    thumbnailImage = item.scaledImage(to: HistoryItemDecorator.thumbnailImageSize)
   }
 
   @MainActor
   private func generatePreviewImage() {
-    guard let image = item.image else {
-      return
-    }
-    previewImage = image.resized(to: HistoryItemDecorator.previewImageSize)
+    previewImage = item.scaledImage(to: HistoryItemDecorator.previewImageSize)
   }
 
   @MainActor
@@ -195,16 +225,19 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
   }
 
   func highlight(_ query: String, _ ranges: [Range<String.Index>]) {
-    guard !query.isEmpty, !title.isEmpty else {
-      attributedTitle = nil
-      return
-    }
+    let active = !query.isEmpty
+    guard isHighlighted != active || highlightRanges != ranges else { return }
+    cachedAttributedTitle = nil
+    isHighlighted = active
+    highlightRanges = ranges
+  }
 
+  private func makeAttributedTitle(_ ranges: [Range<String.Index>], style: HighlightMatch) -> AttributedString {
     var attributedString = AttributedString(title.shortened(to: 500))
     for range in ranges {
       if let lowerBound = AttributedString.Index(range.lowerBound, within: attributedString),
          let upperBound = AttributedString.Index(range.upperBound, within: attributedString) {
-        switch Defaults[.highlightMatch] {
+        switch style {
         case .bold:
           attributedString[lowerBound..<upperBound].font = .bold(.body)()
         case .italic:
@@ -218,14 +251,14 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
       }
     }
 
-    attributedTitle = attributedString
+    return attributedString
   }
 
   private func synchronizeItemPin() {
     _ = withObservationTracking {
       item.pin
     } onChange: { [weak self] in
-      DispatchQueue.main.async {
+      DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         if let pin = self.item.pin {
           self.shortcuts = KeyShortcut.create(character: pin)
@@ -241,7 +274,7 @@ class HistoryItemDecorator: Identifiable, Hashable, HasVisibility {
     _ = withObservationTracking {
       item.title
     } onChange: { [weak self] in
-      DispatchQueue.main.async {
+      DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         self.title = self.item.title
         self.synchronizeItemTitle()

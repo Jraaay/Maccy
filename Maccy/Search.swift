@@ -1,9 +1,10 @@
 import AppKit
+import Darwin
 import Defaults
 import Fuse
 
 class Search {
-  enum Mode: String, CaseIterable, Identifiable, CustomStringConvertible, Defaults.Serializable {
+  nonisolated enum Mode: String, CaseIterable, Identifiable, CustomStringConvertible, Defaults.Serializable, Sendable {
     case exact
     case fuzzy
     case regexp
@@ -33,101 +34,233 @@ class Search {
 
   typealias Searchable = HistoryItemDecorator
 
-  private let fuse = Fuse(threshold: 0.7) // threshold found by trial-and-error
-  private let fuzzySearchLimit = 5_000
-
-  func search(string: String, within: [Searchable]) -> [SearchResult] {
-    guard !string.isEmpty else {
-      return within.map { SearchResult(object: $0) }
-    }
-
-    switch Defaults[.searchMode] {
-    case .mixed:
-      return mixedSearch(string: string, within: within)
-    case .regexp:
-      return simpleSearch(string: string, within: within, options: .regularExpression)
-    case .fuzzy:
-      return fuzzySearch(string: string, within: within)
-    default:
-      return simpleSearch(string: string, within: within, options: .caseInsensitive)
-    }
+  // Only immutable values cross to the search worker; SwiftData and observable UI
+  // objects stay on the main thread.
+  nonisolated struct Document: Sendable {
+    let id: UUID
+    let title: String
+    // Immutable snapshots carry an identity so warm searches need not rescan
+    // every title just to decide whether its index is still valid.
+    let revision = UUID()
   }
 
-  private func fuzzySearch(string: String, within: [Searchable]) -> [SearchResult] {
-    let pattern = fuse.createPattern(from: string)
-    let searchResults: [SearchResult] = within.compactMap { item in
-      fuzzySearch(for: pattern, in: item.title, of: item)
-    }
-    let sortedResults = searchResults.sorted(by: { ($0.score ?? 0) < ($1.score ?? 0) })
-    return sortedResults
+  nonisolated struct Match: Sendable, Equatable {
+    let id: UUID
+    var score: Double?
+    var ranges: [Range<String.Index>] = []
   }
 
-  private func fuzzySearch(
-    for pattern: Fuse.Pattern?,
-    in searchString: String,
-    of item: Searchable
-  ) -> SearchResult? {
-    var searchString = searchString
-    if searchString.count > fuzzySearchLimit {
-      // shortcut to avoid slow search
-      let stopIndex = searchString.index(searchString.startIndex, offsetBy: fuzzySearchLimit)
-      searchString = "\(searchString[...stopIndex])"
+  // Confined to one actor: obsolete searches can be cancelled without racing
+  // updates to the cache. Only title text is indexed, never clipboard payloads.
+  actor Index {
+    private var entries: [UUID: IndexedTitle] = [:]
+
+    var documentCount: Int { entries.count }
+    var indexedByteCount: Int {
+      entries.values.reduce(0) { $0 + $1.bytes.count + $1.checkpoints.count * MemoryLayout<Checkpoint>.stride }
     }
 
-    if let fuzzyResult = fuse.search(pattern, in: searchString) {
-      return SearchResult(
-        score: fuzzyResult.score,
-        object: item,
-        ranges: fuzzyResult.ranges.map {
-          let startIndex = searchString.startIndex
-          let lowerBound = searchString.index(startIndex, offsetBy: $0.lowerBound)
-          let upperBound = searchString.index(startIndex, offsetBy: $0.upperBound + 1)
+    func prepare(documents: [Document]) {
+      retainCurrentDocuments(documents)
+      for document in documents {
+        guard !Task.isCancelled else { return }
+        _ = indexedTitle(for: document)
+      }
+    }
 
-          return lowerBound..<upperBound
+    func search(string: String, documents: [Document], mode: Mode) -> [Match] {
+      guard !Task.isCancelled else { return [] }
+      retainCurrentDocuments(documents)
+      // Keep the original matcher for complex queries. In particular, expanding
+      // case folds (e.g. ß) and partial graphemes have different search semantics.
+      guard (mode == .exact || mode == .mixed), !string.isEmpty,
+            string.unicodeScalars.allSatisfy({
+              $0.isASCII || (0x3400...0x4DBF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value)
+            }) else {
+        return Search.search(string: string, documents: documents, mode: mode, isCancelled: { Task.isCancelled })
+      }
+      let needle = Self.fold(string)
+      return Search.search(
+        string: string, documents: documents, mode: mode, isCancelled: { Task.isCancelled },
+        candidateRange: { document in
+          let entry = self.indexedTitle(for: document)
+          guard let offset = entry.candidateUTF16Offset(for: needle) else { return nil }
+          let start = String.Index(utf16Offset: offset, in: document.title)
+          return start..<document.title.endIndex
         }
       )
-    } else {
-      return nil
+    }
+
+    func retain(documentIDs: Set<UUID>) {
+      entries = entries.filter { documentIDs.contains($0.key) }
+    }
+
+    private func retainCurrentDocuments(_ documents: [Document]) {
+      retain(documentIDs: Set(documents.map(\.id)))
+    }
+
+    private func indexedTitle(for document: Document) -> IndexedTitle {
+      if let entry = entries[document.id], entry.revision == document.revision { return entry }
+      let entry = autoreleasepool { IndexedTitle(document: document) }
+      entries[document.id] = entry
+      return entry
+    }
+
+    nonisolated private static func fold(_ string: String) -> [UInt8] {
+      Array(string.folding(options: .caseInsensitive, locale: nil).decomposedStringWithCanonicalMapping.utf8)
+    }
+
+    nonisolated private struct Checkpoint {
+      let byteOffset: Int
+      let utf16Offset: Int
+    }
+
+    nonisolated private struct IndexedTitle {
+      let revision: UUID
+      var bytes: [UInt8] = []
+      var checkpoints: [Checkpoint] = []
+
+      init(document: Document) {
+        revision = document.revision
+        let title = document.title
+        var start = title.startIndex
+        var utf16Offset = 0
+        // Start verification at a known original grapheme boundary before the
+        // candidate. This preserves the original first match and its exact range.
+        while start < title.endIndex {
+          let end = title.index(start, offsetBy: 32, limitedBy: title.endIndex) ?? title.endIndex
+          let chunk = String(title[start..<end])
+          checkpoints.append(Checkpoint(byteOffset: bytes.count, utf16Offset: utf16Offset))
+          bytes.append(contentsOf: Index.fold(chunk))
+          utf16Offset += chunk.utf16.count
+          start = end
+        }
+      }
+
+      func candidateUTF16Offset(for needle: [UInt8]) -> Int? {
+        guard !needle.isEmpty, bytes.count >= needle.count else { return nil }
+        let offset: Int? = bytes.withUnsafeBytes { haystack in
+          needle.withUnsafeBytes { pattern in
+            guard let found = memmem(haystack.baseAddress!, haystack.count, pattern.baseAddress!, pattern.count) else {
+              return nil
+            }
+            return haystack.baseAddress!.distance(to: UnsafeRawPointer(found))
+          }
+        }
+        guard let offset else { return nil }
+        var lower = 0
+        var upper = checkpoints.count
+        while lower < upper {
+          let middle = (lower + upper) / 2
+          if checkpoints[middle].byteOffset <= offset { lower = middle + 1 } else { upper = middle }
+        }
+        return checkpoints[lower - 1].utf16Offset
+      }
     }
   }
 
-  private func simpleSearch(
+  func search(string: String, within: [Searchable]) -> [SearchResult] {
+    let objects = Dictionary(uniqueKeysWithValues: within.map { ($0.id, $0) })
+    return Self.search(
+      string: string,
+      documents: within.map(\.searchDocument),
+      mode: Defaults[.searchMode]
+    ).compactMap { match in
+      guard let object = objects[match.id] else { return nil }
+      return SearchResult(score: match.score, object: object, ranges: match.ranges)
+    }
+  }
+
+  nonisolated static func search(
     string: String,
-    within: [Searchable],
-    options: NSString.CompareOptions
-  ) -> [SearchResult] {
-    return within.compactMap { simpleSearch(for: string, in: $0.title, of: $0, options: options) }
-  }
+    documents: [Document],
+    mode: Mode,
+    isCancelled: () -> Bool = { false },
+    candidateRange: ((Document) -> Range<String.Index>?)? = nil
+  ) -> [Match] {
+    guard !isCancelled() else { return [] }
+    guard !string.isEmpty else { return documents.map { Match(id: $0.id) } }
 
-  private func simpleSearch(
-    for string: String,
-    in searchString: String,
-    of item: Searchable,
-    options: NSString.CompareOptions
-  ) -> SearchResult? {
-    if let range = searchString.range(of: string, options: options, range: nil, locale: nil) {
-      return SearchResult(object: item, ranges: [range])
-    } else {
-      return nil
+    switch mode {
+    case .exact:
+      return exactSearch(string, documents, isCancelled, candidateRange)
+    case .regexp:
+      return regexSearch(string, documents, isCancelled)
+    case .fuzzy:
+      return fuzzySearch(string, documents, isCancelled)
+    case .mixed:
+      let exact = exactSearch(string, documents, isCancelled, candidateRange)
+      guard exact.isEmpty, !isCancelled() else { return exact }
+      let regex = regexSearch(string, documents, isCancelled)
+      guard regex.isEmpty, !isCancelled() else { return regex }
+      return fuzzySearch(string, documents, isCancelled)
     }
   }
 
-  private func mixedSearch(string: String, within: [Searchable]) -> [SearchResult] {
-    var results = simpleSearch(string: string, within: within, options: .caseInsensitive)
-    guard results.isEmpty else {
-      return results
+  nonisolated private static func exactSearch(
+    _ query: String, _ documents: [Document], _ isCancelled: () -> Bool,
+    _ candidateRange: ((Document) -> Range<String.Index>?)?
+  ) -> [Match] {
+    var results: [Match] = []
+    for document in documents {
+      guard !isCancelled() else { return [] }
+      let bounds: Range<String.Index>
+      if let candidateRange {
+        guard let candidate = candidateRange(document) else { continue }
+        bounds = candidate
+      } else {
+        bounds = document.title.startIndex..<document.title.endIndex
+      }
+      if let range = document.title.range(of: query, options: .caseInsensitive, range: bounds) {
+        results.append(Match(id: document.id, ranges: [range]))
+      }
     }
+    return results
+  }
 
-    results = simpleSearch(string: string, within: within, options: .regularExpression)
-    guard results.isEmpty else {
-      return results
+  nonisolated private static func regexSearch(
+    _ query: String, _ documents: [Document], _ isCancelled: () -> Bool
+  ) -> [Match] {
+    // Compile once per query rather than once per history entry.
+    guard let regex = try? NSRegularExpression(pattern: query) else { return [] }
+    var results: [Match] = []
+    for document in documents {
+      guard !isCancelled() else { return [] }
+      let title = document.title
+      regex.enumerateMatches(in: title, options: .reportProgress, range: NSRange(title.startIndex..., in: title)) {
+        match, _, stop in
+        if isCancelled() {
+          stop.pointee = true
+        } else if let match, let range = Range(match.range, in: title) {
+          results.append(Match(id: document.id, ranges: [range]))
+          stop.pointee = true
+        }
+      }
     }
+    return isCancelled() ? [] : results
+  }
 
-    results = fuzzySearch(string: string, within: within)
-    guard results.isEmpty else {
-      return results
+  nonisolated private static func fuzzySearch(
+    _ query: String, _ documents: [Document], _ isCancelled: () -> Bool
+  ) -> [Match] {
+    let fuse = Fuse(threshold: 0.7)
+    let pattern = fuse.createPattern(from: query)
+    var results: [Match] = []
+    for document in documents {
+      guard !isCancelled() else { return [] }
+      // Preserve the original 5,001-character window without counting the whole title.
+      let title = String(document.title.prefix(5_001))
+      if let match = fuse.search(pattern, in: title) {
+        // Build indices in the original string, including for long Unicode titles.
+        let ranges = match.ranges.map { range in
+          let lower = document.title.index(document.title.startIndex, offsetBy: range.lowerBound)
+          let upper = document.title.index(lower, offsetBy: range.count)
+          return lower..<upper
+        }
+        results.append(Match(id: document.id, score: match.score, ranges: ranges))
+      }
     }
-
-    return []
+    guard !isCancelled() else { return [] }
+    return results.sorted { ($0.score ?? 0) < ($1.score ?? 0) }
   }
 }

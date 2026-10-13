@@ -1,6 +1,8 @@
 import XCTest
 import Defaults
 import SwiftData
+import Observation
+import os
 @testable import Maccy
 
 @MainActor
@@ -26,6 +28,76 @@ class HistoryTests: XCTestCase { // swiftlint:disable:this type_body_length
     Defaults[.sortBy] = savedSortBy
     Defaults[.pinOrder] = savedPinOrder
     Defaults[.pinTo] = savedPinTo
+  }
+
+  func testRapidSearchAndClearUseLatestQuery() async throws {
+    let savedMode = Defaults[.searchMode]
+    defer { Defaults[.searchMode] = savedMode }
+    Defaults[.searchMode] = .exact
+    let first = history.add(historyItem("unique alpha"))
+    let second = history.add(historyItem("unique beta"))
+    for _ in 0..<20 {
+      history.searchQuery = "alpha"
+      history.searchQuery = "beta"
+    }
+    try await waitForItems([second])
+    history.searchQuery = "alpha"
+    history.searchQuery = ""
+    try await waitForItems([second, first])
+    XCTAssertNil(first.attributedTitle)
+    XCTAssertNil(second.attributedTitle)
+  }
+
+  func testDeletingDuringSearchDoesNotRestoreDeletedItem() async throws {
+    let first = history.add(historyItem("matching first"))
+    let second = history.add(historyItem("matching second"))
+    history.searchQuery = "matching"
+    history.delete(first)
+    try await waitForItems([second])
+    try await Task.sleep(for: .milliseconds(150))
+    XCTAssertEqual(history.items.map(\.item), [second.item])
+    history.searchQuery = ""
+  }
+
+  func testMenuTextDoesNotObserveEveryHistoryItem() {
+    let older = history.add(historyItem("older"))
+    history.add(historyItem("newest"))
+    let changed = OSAllocatedUnfairLock(initialState: false)
+    withObservationTracking {
+      _ = AppState.shared.menuIconText
+    } onChange: {
+      changed.withLock { $0 = true }
+    }
+    older.item.pin = "x"
+    XCTAssertFalse(changed.withLock { $0 }, "Menu text must only observe the first unpinned entry")
+  }
+
+  private func waitForItems(_ expected: [HistoryItemDecorator]) async throws {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    while history.items.map(\.item) != expected.map(\.item) && ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    // Let a pending clear/search apply even if the initial list already matches.
+    try await Task.sleep(for: .milliseconds(100))
+    XCTAssertEqual(history.items.map(\.item), expected.map(\.item))
+  }
+
+  func testImageFilesAreRemovedOnlyAfterTheirReferencesAreDeleted() throws {
+    let bytes = Data(repeating: 42, count: 256)
+    let original = HistoryItemContent(type: "public.png", value: bytes)
+    let first = history.add(HistoryItem(contents: [original]))
+    let originalURL = try XCTUnwrap(original.fileURL)
+    let duplicateContent = HistoryItemContent(type: "public.png", value: bytes)
+    let duplicateURL = try XCTUnwrap(duplicateContent.fileURL)
+    let merged = history.add(HistoryItem(contents: [duplicateContent]))
+    XCTAssertNotEqual(first, merged)
+    XCTAssertEqual(history.items.count, 1)
+    try Storage.shared.saveAndCleanPayloads()
+    XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: duplicateURL.path))
+    XCTAssertEqual(try merged.item.contents.first?.readData(), bytes)
+    history.delete(merged)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
   }
 
   func testDefaultIsEmpty() {
